@@ -1,0 +1,9 @@
+services:
+  ocs-ai-answer:
+    image: ghcr.io/mgrsc/ocs-ai-answer
+    container_name: ocs-ai-answer
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./.env
+    restart: unless-stopped
