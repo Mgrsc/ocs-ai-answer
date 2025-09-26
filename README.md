@@ -1,6 +1,6 @@
 # OCS AI Answer Service
 
-一个基于 Bun 的轻量级服务，提供 `/answer` 接口，代理 OpenAI 兼容的对话模型，专为需要稳定 JSON 返回结构的 OCS 题库系统设计。
+代理 OpenAI 兼容的对话模型，用于[OCS 网课助手](https://docs.ocsjs.com)的题库。
 
 ## ✨ 核心特性
 
