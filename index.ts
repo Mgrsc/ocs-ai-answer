@@ -9,6 +9,9 @@ const SYSTEM_PROMPT =
   'Return exactly one JSON object with two string fields: "question" and "answer". Copy the user question exactly into "question". Put the best direct answer into "answer". If the answer cannot be determined, set "answer" to "无法找到答案". Do not output markdown, code fences, explanations, or extra keys.';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const PORT = Number(process.env.PORT || 3000);
+const DEBUG_REQUEST_DETAILS =
+  process.env.DEBUG_REQUEST_DETAILS === "1" ||
+  process.env.DEBUG_REQUEST_DETAILS === "true";
 const NO_ANSWER = "无法找到答案";
 
 if (!OPENAI_API_KEY) {
@@ -75,6 +78,7 @@ console.log(
     model: OPENAI_MODEL,
     baseUrl: OPENAI_BASE_URL,
     systemPromptLength: SYSTEM_PROMPT.length,
+    debugRequestDetails: DEBUG_REQUEST_DETAILS,
   })
 );
 
@@ -133,6 +137,40 @@ function previewText(value: string, maxLength = 160) {
     return normalized;
   }
   return `${normalized.slice(0, maxLength)}...`;
+}
+
+function summarizeValue(value: unknown) {
+  if (typeof value === "string") {
+    return {
+      type: "string",
+      length: value.length,
+      preview: previewText(value, 240),
+    };
+  }
+
+  if (Array.isArray(value)) {
+    const joinedPreview = value
+      .map((item) => (typeof item === "string" ? item : JSON.stringify(item)))
+      .join(" | ");
+    return {
+      type: "array",
+      length: value.length,
+      preview: previewText(joinedPreview, 240),
+    };
+  }
+
+  if (value && typeof value === "object") {
+    return {
+      type: "object",
+      keys: Object.keys(value as Record<string, unknown>),
+      preview: previewText(JSON.stringify(value), 240),
+    };
+  }
+
+  return {
+    type: value === null ? "null" : typeof value,
+    preview: String(value),
+  };
 }
 
 function buildOpenAIRequest(question: string, mode: UpstreamMode) {
@@ -626,24 +664,50 @@ serve({
       return jsonResponse({ error: "JSON 格式错误" }, 400);
     }
 
+    const receivedKeys =
+      questionData && typeof questionData === "object" ? Object.keys(questionData) : [];
+    const optionsValue =
+      questionData && typeof questionData === "object"
+        ? (questionData as Record<string, unknown>).options
+        : undefined;
+    const typeValue =
+      questionData && typeof questionData === "object"
+        ? (questionData as Record<string, unknown>).type
+        : undefined;
+
     const question =
       typeof questionData?.question === "string" ? questionData.question.trim() : "";
 
     if (!question) {
       log("WARN", "request_question_missing", {
         requestId,
-        receivedKeys:
-          questionData && typeof questionData === "object"
-            ? Object.keys(questionData)
-            : [],
+        receivedKeys,
+        requestSummary: DEBUG_REQUEST_DETAILS
+          ? {
+              question: summarizeValue(
+                questionData && typeof questionData === "object"
+                  ? (questionData as Record<string, unknown>).question
+                  : undefined
+              ),
+              options: summarizeValue(optionsValue),
+              type: summarizeValue(typeValue),
+              bodyPreview: previewText(requestBody, 400),
+            }
+          : undefined,
       });
       return jsonResponse({ error: "缺少 'question' 字段" }, 400);
     }
 
     log("INFO", "answer_request_validated", {
       requestId,
+      receivedKeys,
       questionLength: question.length,
       questionPreview: previewText(question, 120),
+      hasOptions: optionsValue !== undefined && optionsValue !== null,
+      optionsSummary:
+        optionsValue !== undefined ? summarizeValue(optionsValue) : undefined,
+      typeSummary: typeValue !== undefined ? summarizeValue(typeValue) : undefined,
+      requestBodyPreview: DEBUG_REQUEST_DETAILS ? previewText(requestBody, 400) : undefined,
     });
 
     try {

@@ -81,6 +81,7 @@ docker compose up -d
 
 - `SYSTEM_PROMPT` 应保持短小，只表达输出契约。
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
+- 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。
 - 对可恢复的上游错误，服务会降级返回合法 JSON，`answer` 固定为 `"无法找到答案"`。
 
 ## 帮助

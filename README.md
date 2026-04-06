@@ -81,6 +81,7 @@ Replace the host in `homepage` and `url` with your deployment address:
 
 - `SYSTEM_PROMPT` should stay short and contract-focused.
 - The service does not send `max_tokens`, `temperature`, or similar sampling controls.
+- Set `DEBUG_REQUEST_DETAILS=true` to log incoming request keys plus summarized `question`, `options`, and `type` values when checking what OCS actually sent.
 - Recoverable upstream failures degrade to a valid answer payload with `"无法找到答案"`.
 
 ## Help

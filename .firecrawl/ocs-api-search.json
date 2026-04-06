@@ -1,0 +1,1 @@
+{"success":true,"data":{"web":[{"url":"https://docs.ocsjs.com/docs/other/api","title":"开发文档 - OCS网课助手","description":"如果题库接口不存在题目的内容，题目可以直接写undefined ，（OCS 会自动将搜索的题目显示）. 假设接口数据(res)为：. { \"code\": 1, \"answer\": \"实现中华民族伟大复兴 ...","position":1}]}}

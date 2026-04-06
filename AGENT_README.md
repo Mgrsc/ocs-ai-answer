@@ -63,6 +63,10 @@
 - `SYSTEM_PROMPT`
   - optional
   - should stay compact and only define the output contract
+- `DEBUG_REQUEST_DETAILS`
+  - optional
+  - default: `false`
+  - when enabled, request validation logs include received top-level keys and summarized `question`, `options`, `type`, and request body previews
 - `PORT`
   - optional
   - default: `3000`
@@ -93,6 +97,10 @@
   - `answer_response_ready`
 - Repair visibility:
   - `repairFlags` may include `bomRemoved`, `codeFenceStripped`, `smartQuotesNormalized`, `outerJsonExtracted`
+- Request debug visibility:
+  - `answer_request_validated` always logs `receivedKeys`
+  - when `DEBUG_REQUEST_DETAILS=true`, it also logs `requestBodyPreview`
+  - `optionsSummary` and `typeSummary` help confirm whether OCS sent `options` or `type`
 
 ## Failure Model
 
