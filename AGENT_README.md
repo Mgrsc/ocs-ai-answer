@@ -3,13 +3,13 @@
 ## Overview
 
 - Single-entry Bun service in `index.ts`.
-- Purpose: accept `POST /answer` with `{"question":"..."}` and return `{"question":"...","answer":"..."}` for OCS.
+- Purpose: accept `POST /answer` with `{"question":"...","options"?: string[] | string,"type"?: string}` and return `{"question":"...","answer":"..."}` for OCS.
 - Upstream target is an OpenAI-compatible Chat Completions endpoint defined by `OPENAI_BASE_URL`.
 
 ## Runtime Flow
 
-1. Validate request JSON and extract `question`.
-2. Send the upstream request in `json` mode with `response_format: { type: "json_object" }`.
+1. Validate request JSON and extract `question`, optional `options`, and optional `type`.
+2. Build the upstream user prompt from question context, including options and type when present, then send the request in `json` mode with `response_format: { type: "json_object" }`.
 3. If the provider rejects JSON mode or returns unusable content, retry once in `fallback` mode without `response_format`.
 4. Extract content from compatible shapes:
    - `choices[0].message.content` string
@@ -18,8 +18,7 @@
 5. Repair common output issues:
    - remove BOM
    - strip fenced code blocks
-   - normalize smart quotes
-   - isolate the first complete JSON object
+  - isolate the first complete JSON object
 6. Validate the parsed payload and enforce:
    - `question` must be a string, otherwise reuse the incoming question
    - `answer` must be a non-empty string, otherwise use `"无法找到答案"`
@@ -36,7 +35,7 @@
 
 - Request body:
   ```json
-  { "question": "..." }
+  { "question": "...", "options": ["..."], "type": "single" }
   ```
 - Success body:
   ```json

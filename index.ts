@@ -30,8 +30,13 @@ type UpstreamMode = "json" | "fallback";
 type RepairFlags = {
   bomRemoved: boolean;
   codeFenceStripped: boolean;
-  smartQuotesNormalized: boolean;
   outerJsonExtracted: boolean;
+};
+
+type AnswerRequestInput = {
+  question: string;
+  options?: string[];
+  type?: string;
 };
 
 type ExtractedContent = {
@@ -173,12 +178,49 @@ function summarizeValue(value: unknown) {
   };
 }
 
-function buildOpenAIRequest(question: string, mode: UpstreamMode) {
+function normalizeOptions(value: unknown) {
+  if (typeof value === "string") {
+    return value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  return undefined;
+}
+
+function buildUpstreamQuestion(input: AnswerRequestInput) {
+  const parts = [`Question: ${input.question}`];
+
+  if (input.type) {
+    parts.push(`Type: ${input.type}`);
+  }
+
+  if (input.options && input.options.length > 0) {
+    parts.push(`Options:\n${input.options.join("\n")}`);
+  }
+
+  parts.push(
+    "Answer with the best direct answer only. For judgement questions, answer with one of the provided options."
+  );
+
+  return parts.join("\n\n");
+}
+
+function buildOpenAIRequestFromInput(input: AnswerRequestInput, mode: UpstreamMode) {
+  const prompt = buildUpstreamQuestion(input);
   const body: Record<string, unknown> = {
     model: OPENAI_MODEL,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: question },
+      { role: "user", content: prompt },
     ],
   };
 
@@ -187,12 +229,6 @@ function buildOpenAIRequest(question: string, mode: UpstreamMode) {
   }
 
   return body;
-}
-
-function normalizeSmartQuotes(value: string) {
-  return value
-    .replace(/[\u201c\u201d\u201e\u201f]/g, '"')
-    .replace(/[\u2018\u2019\u201a\u201b]/g, "'");
 }
 
 function stripCodeFences(value: string) {
@@ -261,7 +297,6 @@ function sanitizeModelResponse(rawText: string) {
   const repairFlags: RepairFlags = {
     bomRemoved: false,
     codeFenceStripped: false,
-    smartQuotesNormalized: false,
     outerJsonExtracted: false,
   };
 
@@ -275,12 +310,6 @@ function sanitizeModelResponse(rawText: string) {
   const fenceResult = stripCodeFences(sanitized);
   sanitized = fenceResult.text;
   repairFlags.codeFenceStripped = fenceResult.changed;
-
-  const normalizedQuotes = normalizeSmartQuotes(sanitized);
-  if (normalizedQuotes !== sanitized) {
-    sanitized = normalizedQuotes;
-    repairFlags.smartQuotesNormalized = true;
-  }
 
   const extractedJson = extractFirstJsonObject(sanitized);
   if (extractedJson && extractedJson !== sanitized) {
@@ -399,19 +428,22 @@ function shouldRetryWithoutJsonMode(status: number, bodyText: string) {
 }
 
 async function runUpstreamAttempt(
-  question: string,
+  input: AnswerRequestInput,
   requestId: string,
   mode: UpstreamMode
 ): Promise<AttemptResult> {
-  const body = buildOpenAIRequest(question, mode);
+  const body = buildOpenAIRequestFromInput(input, mode);
   const startedAt = Date.now();
 
   log("INFO", "upstream_request_started", {
     requestId,
     mode,
     model: OPENAI_MODEL,
-    questionLength: question.length,
-    questionPreview: previewText(question, 120),
+    questionLength: input.question.length,
+    questionPreview: previewText(input.question, 120),
+    hasOptions: Boolean(input.options && input.options.length > 0),
+    optionsCount: input.options?.length || 0,
+    questionType: input.type || null,
   });
 
   let response: Response;
@@ -503,7 +535,7 @@ async function runUpstreamAttempt(
   }
 
   try {
-    const { payload, repairFlags } = parseAnswerPayload(extracted.rawText, question);
+    const { payload, repairFlags } = parseAnswerPayload(extracted.rawText, input.question);
     return {
       ok: true,
       mode,
@@ -530,8 +562,8 @@ async function runUpstreamAttempt(
   }
 }
 
-async function getAnswerFromUpstream(question: string, requestId: string) {
-  const firstAttempt = await runUpstreamAttempt(question, requestId, "json");
+async function getAnswerFromUpstream(input: AnswerRequestInput, requestId: string) {
+  const firstAttempt = await runUpstreamAttempt(input, requestId, "json");
 
   if (firstAttempt.ok) {
     return {
@@ -555,7 +587,7 @@ async function getAnswerFromUpstream(question: string, requestId: string) {
   });
 
   if (firstAttempt.shouldRetryFallback) {
-    const secondAttempt = await runUpstreamAttempt(question, requestId, "fallback");
+    const secondAttempt = await runUpstreamAttempt(input, requestId, "fallback");
 
     if (secondAttempt.ok) {
       return {
@@ -580,7 +612,7 @@ async function getAnswerFromUpstream(question: string, requestId: string) {
   }
 
   return {
-    payload: createFallbackPayload(question),
+    payload: createFallbackPayload(input.question),
     mode: "fallback" as UpstreamMode,
     degraded: true,
   };
@@ -674,6 +706,11 @@ serve({
       questionData && typeof questionData === "object"
         ? (questionData as Record<string, unknown>).type
         : undefined;
+    const options = normalizeOptions(optionsValue);
+    const questionType =
+      typeof typeValue === "string" && typeValue.trim().length > 0
+        ? typeValue.trim()
+        : undefined;
 
     const question =
       typeof questionData?.question === "string" ? questionData.question.trim() : "";
@@ -711,7 +748,14 @@ serve({
     });
 
     try {
-      const result = await getAnswerFromUpstream(question, requestId);
+      const result = await getAnswerFromUpstream(
+        {
+          question,
+          options,
+          type: questionType,
+        },
+        requestId
+      );
 
       log(result.degraded ? "WARN" : "INFO", "answer_response_ready", {
         requestId,

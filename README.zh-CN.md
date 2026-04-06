@@ -10,6 +10,7 @@
 - 基于 Bun 的 HTTP 服务，日志为便于排查的逐行结构化输出。
 - 默认优先使用 JSON 模式请求上游；若 `response_format` 不被支持，会自动回退。
 - 固定输出结构：`{"question":"...","answer":"..."}`。
+- 支持接收 OCS 传来的可选 `options` 和 `type` 字段，提升单选、多选、判断题的命中率。
 - 自动修复常见异常输出，例如 Markdown 代码块包裹的 JSON、尾随解释文本等。
 - 对可恢复的上游异常统一降级为 `"无法找到答案"`，避免 OCS 误判为题库连接失败。
 - 支持 Dockerfile 与 Docker Compose 部署。
@@ -39,7 +40,7 @@ bun run index.ts
 ```bash
 curl -X POST http://localhost:3000/answer \
   -H 'Content-Type: application/json' \
-  -d '{"question":"下列关于家庭表述中，不正确的是（）。"}'
+  -d '{"question":"下列关于家庭表述中，不正确的是（）。","options":["A. 甲","B. 乙","C. 丙","D. 丁"],"type":"single"}'
 ```
 
 期望返回结构：
@@ -70,7 +71,7 @@ docker compose up -d
     "method": "post",
     "type": "GM_xmlhttpRequest",
     "contentType": "json",
-    "data": { "question": "${title}" },
+    "data": { "question": "${title}", "options": "${options}", "type": "${type}" },
     "headers": { "Content-Type": "application/json" },
     "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
   }
@@ -82,6 +83,7 @@ docker compose up -d
 - `SYSTEM_PROMPT` 应保持短小，只表达输出契约。
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
 - 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。
+- `POST /answer` 额外支持可选的 `options`、`type` 字段，并会一并传给上游模型。
 - 对可恢复的上游错误，服务会降级返回合法 JSON，`answer` 固定为 `"无法找到答案"`。
 
 ## 帮助
