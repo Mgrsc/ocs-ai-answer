@@ -6,7 +6,7 @@ const OPENAI_BASE_URL =
   process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions";
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  'Return exactly one JSON object with two string fields: "question" and "answer". Copy the user question exactly into "question". Put the best direct answer into "answer". If the answer cannot be determined, set "answer" to "无法找到答案". Do not output markdown, code fences, explanations, or extra keys.';
+  'Return exactly one JSON object with two string fields: "question" and "answer". Copy the user question exactly into "question". Put only the final answer into "answer". If the answer cannot be determined, set "answer" to "无法找到答案". For single-choice and judgement questions, answer with exactly one provided option. For multiple-choice questions, return all correct options joined by "#", preserving the original option text order from the user input. Do not output markdown, code fences, explanations, or extra keys.';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const PORT = Number(process.env.PORT || 3000);
 const DEBUG_REQUEST_DETAILS =
@@ -207,9 +207,37 @@ function buildUpstreamQuestion(input: AnswerRequestInput) {
     parts.push(`Options:\n${input.options.join("\n")}`);
   }
 
-  parts.push(
-    "Answer with the best direct answer only. For judgement questions, answer with one of the provided options."
-  );
+  if (input.type === "multiple") {
+    parts.push(
+      [
+        "This is a multiple-choice question.",
+        'Return every correct option in the "answer" field.',
+        'Join multiple correct options with "#" and do not use commas, spaces, or explanations.',
+        'Use the original option text exactly as provided.',
+      ].join(" ")
+    );
+  } else if (input.type === "single") {
+    parts.push(
+      [
+        "This is a single-choice question.",
+        'Return exactly one option in the "answer" field.',
+        'Use the original option text exactly as provided.',
+      ].join(" ")
+    );
+  } else if (input.type === "judgement") {
+    parts.push(
+      [
+        "This is a judgement question.",
+        'Return exactly one provided option in the "answer" field, usually one of 对 or 错.',
+      ].join(" ")
+    );
+  } else if (input.type === "completion") {
+    parts.push(
+      'This is a completion question. Return only the missing content in the "answer" field.'
+    );
+  } else {
+    parts.push('Return only the best direct answer in the "answer" field.');
+  }
 
   return parts.join("\n\n");
 }

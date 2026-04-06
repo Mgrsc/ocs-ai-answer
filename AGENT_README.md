@@ -61,7 +61,7 @@
   - wrong value usually causes upstream 4xx or empty provider responses
 - `SYSTEM_PROMPT`
   - optional
-  - should stay compact and only define the output contract
+  - when unset, the service uses a built-in default prompt with OCS-oriented rules for single, multiple, and judgement questions
 - `DEBUG_REQUEST_DETAILS`
   - optional
   - default: `false`

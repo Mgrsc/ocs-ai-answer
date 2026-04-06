@@ -80,7 +80,7 @@ docker compose up -d
 
 ## 配置说明
 
-- `SYSTEM_PROMPT` 应保持短小，只表达输出契约。
+- 如果不传 `SYSTEM_PROMPT`，服务会使用内置默认提示词，默认按 OCS 题型约束单选、多选、判断题的答案格式。
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
 - 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。
 - `POST /answer` 额外支持可选的 `options`、`type` 字段，并会一并传给上游模型。

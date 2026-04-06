@@ -80,7 +80,7 @@ Replace the host in `homepage` and `url` with your deployment address:
 
 ## Configuration Notes
 
-- `SYSTEM_PROMPT` should stay short and contract-focused.
+- If `SYSTEM_PROMPT` is not provided, the service uses a built-in default prompt that enforces OCS-friendly single-choice, multiple-choice, and judgement answer formatting.
 - The service does not send `max_tokens`, `temperature`, or similar sampling controls.
 - Set `DEBUG_REQUEST_DETAILS=true` to log incoming request keys plus summarized `question`, `options`, and `type` values when checking what OCS actually sent.
 - `POST /answer` accepts optional `options` and `type` fields and injects them into the upstream prompt.
