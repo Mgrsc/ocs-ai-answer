@@ -2,40 +2,95 @@ import { serve } from "bun";
 import "dotenv/config";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions";
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "你是一个通用的AI助手。";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-3.5-turbo-0125";
-const PORT = process.env.PORT || 3000;
+const OPENAI_BASE_URL =
+  process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions";
+const SYSTEM_PROMPT =
+  process.env.SYSTEM_PROMPT ||
+  'Return exactly one JSON object with two string fields: "question" and "answer". Copy the user question exactly into "question". Put the best direct answer into "answer". If the answer cannot be determined, set "answer" to "无法找到答案". Do not output markdown, code fences, explanations, or extra keys.';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const PORT = Number(process.env.PORT || 3000);
+const NO_ANSWER = "无法找到答案";
 
 if (!OPENAI_API_KEY) {
-  console.error("❌ Error: OPENAI_API_KEY is not set in .env file.");
-  process.exit(1);
-}
-if (!OPENAI_MODEL) {
-  console.error("❌ Error: OPENAI_MODEL is not set in .env file.");
+  console.error("OPENAI_API_KEY is not set.");
   process.exit(1);
 }
 
-console.log(`🚀 AI Question Bank server running on http://localhost:${PORT}`);
-console.log(`🌐 Server also accessible via http://192.168.1.11:${PORT}`);
-console.log(`📡 OpenAI Base URL: ${OPENAI_BASE_URL}`);
-console.log(`🤖 OpenAI Model: ${OPENAI_MODEL}`);
-console.log(`🔧 System Prompt: ${SYSTEM_PROMPT.substring(0, 100)}...`);
-console.log("=".repeat(80));
+if (!OPENAI_MODEL) {
+  console.error("OPENAI_MODEL is not set.");
+  process.exit(1);
+}
+
+type LogLevel = "INFO" | "WARN" | "ERROR";
+type UpstreamMode = "json" | "fallback";
+
+type RepairFlags = {
+  bomRemoved: boolean;
+  codeFenceStripped: boolean;
+  smartQuotesNormalized: boolean;
+  outerJsonExtracted: boolean;
+};
+
+type ExtractedContent = {
+  rawText?: string;
+  finishReason?: string;
+  contentType: "string" | "parts" | "text" | "missing";
+};
+
+type AttemptResult =
+  | {
+      ok: true;
+      mode: UpstreamMode;
+      payload: { question: string; answer: string };
+      finishReason?: string;
+      repairFlags: RepairFlags;
+      rawPreview: string;
+      status: number;
+      durationMs: number;
+    }
+  | {
+      ok: false;
+      mode: UpstreamMode;
+      category:
+        | "transport_error"
+        | "upstream_http_error"
+        | "empty_content"
+        | "invalid_json"
+        | "invalid_payload";
+      finishReason?: string;
+      repairFlags?: RepairFlags;
+      rawPreview?: string;
+      status?: number;
+      durationMs: number;
+      details: string;
+      shouldRetryFallback: boolean;
+    };
+
+console.log(
+  JSON.stringify({
+    level: "INFO",
+    event: "server_start",
+    timestamp: new Date().toISOString(),
+    port: PORT,
+    model: OPENAI_MODEL,
+    baseUrl: OPENAI_BASE_URL,
+    systemPromptLength: SYSTEM_PROMPT.length,
+  })
+);
 
 function getTimestamp() {
   return new Date().toISOString();
 }
 
-function logRequestDetails(req: Request, clientIP: string) {
-  console.log(`📥 [${getTimestamp()}] 收到请求:`);
-  console.log(`   方法: ${req.method}`);
-  console.log(`   URL: ${req.url}`);
-  console.log(`   客户端IP: ${clientIP}`);
-  console.log(`   User-Agent: ${req.headers.get('User-Agent') || 'Unknown'}`);
-  console.log(`   Content-Type: ${req.headers.get('Content-Type') || 'Unknown'}`);
-  console.log(`   Origin: ${req.headers.get('Origin') || 'None'}`);
-  console.log(`   Referer: ${req.headers.get('Referer') || 'None'}`);
+function log(level: LogLevel, event: string, details: Record<string, unknown> = {}) {
+  console.log(
+    JSON.stringify({
+      level,
+      event,
+      timestamp: getTimestamp(),
+      ...details,
+    })
+  );
 }
 
 function getCorsHeaders() {
@@ -43,7 +98,453 @@ function getCorsHeaders() {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...getCorsHeaders(),
+    },
+  });
+}
+
+function createFallbackPayload(question: string) {
+  return {
+    question,
+    answer: NO_ANSWER,
+  };
+}
+
+function getClientIp(req: Request) {
+  return (
+    req.headers.get("x-forwarded-for") ||
+    req.headers.get("x-real-ip") ||
+    "Unknown"
+  );
+}
+
+function previewText(value: string, maxLength = 160) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function buildOpenAIRequest(question: string, mode: UpstreamMode) {
+  const body: Record<string, unknown> = {
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: question },
+    ],
+  };
+
+  if (mode === "json") {
+    body.response_format = { type: "json_object" };
+  }
+
+  return body;
+}
+
+function normalizeSmartQuotes(value: string) {
+  return value
+    .replace(/[\u201c\u201d\u201e\u201f]/g, '"')
+    .replace(/[\u2018\u2019\u201a\u201b]/g, "'");
+}
+
+function stripCodeFences(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("```")) {
+    return { text: trimmed, changed: false };
+  }
+
+  const match = trimmed.match(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```$/);
+  if (!match) {
+    return { text: trimmed, changed: false };
+  }
+
+  return { text: match[1].trim(), changed: true };
+}
+
+function extractFirstJsonObject(value: string) {
+  const startIndex = value.indexOf("{");
+  if (startIndex === -1) {
+    return undefined;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = startIndex; index < value.length; index += 1) {
+    const char = value[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) {
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return value.slice(startIndex, index + 1);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function sanitizeModelResponse(rawText: string) {
+  const repairFlags: RepairFlags = {
+    bomRemoved: false,
+    codeFenceStripped: false,
+    smartQuotesNormalized: false,
+    outerJsonExtracted: false,
+  };
+
+  let sanitized = rawText.trim();
+
+  if (sanitized.charCodeAt(0) === 0xfeff) {
+    sanitized = sanitized.slice(1);
+    repairFlags.bomRemoved = true;
+  }
+
+  const fenceResult = stripCodeFences(sanitized);
+  sanitized = fenceResult.text;
+  repairFlags.codeFenceStripped = fenceResult.changed;
+
+  const normalizedQuotes = normalizeSmartQuotes(sanitized);
+  if (normalizedQuotes !== sanitized) {
+    sanitized = normalizedQuotes;
+    repairFlags.smartQuotesNormalized = true;
+  }
+
+  const extractedJson = extractFirstJsonObject(sanitized);
+  if (extractedJson && extractedJson !== sanitized) {
+    sanitized = extractedJson.trim();
+    repairFlags.outerJsonExtracted = true;
+  }
+
+  return {
+    sanitized,
+    repairFlags,
+  };
+}
+
+function extractMessageText(content: unknown) {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const parts = content
+    .map((part) => {
+      if (typeof part === "string") {
+        return part;
+      }
+
+      if (part && typeof part === "object") {
+        const candidate = (part as Record<string, unknown>).text;
+        if (typeof candidate === "string") {
+          return candidate;
+        }
+      }
+
+      return "";
+    })
+    .filter(Boolean);
+
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
+function extractUpstreamContent(openaiData: any): ExtractedContent {
+  const choice = openaiData?.choices?.[0];
+  const messageContent = choice?.message?.content;
+
+  if (typeof messageContent === "string") {
+    return {
+      rawText: messageContent,
+      finishReason: choice?.finish_reason,
+      contentType: "string",
+    };
+  }
+
+  const partsText = extractMessageText(messageContent);
+  if (partsText) {
+    return {
+      rawText: partsText,
+      finishReason: choice?.finish_reason,
+      contentType: "parts",
+    };
+  }
+
+  if (typeof choice?.text === "string") {
+    return {
+      rawText: choice.text,
+      finishReason: choice?.finish_reason,
+      contentType: "text",
+    };
+  }
+
+  return {
+    finishReason: choice?.finish_reason,
+    contentType: "missing",
+  };
+}
+
+function parseAnswerPayload(rawText: string, originalQuestion: string) {
+  const { sanitized, repairFlags } = sanitizeModelResponse(rawText);
+  const parsed = JSON.parse(sanitized);
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("response is not a JSON object");
+  }
+
+  const response = parsed as Record<string, unknown>;
+  const question =
+    typeof response.question === "string" && response.question.trim().length > 0
+      ? response.question.trim()
+      : originalQuestion;
+  const answer =
+    typeof response.answer === "string" && response.answer.trim().length > 0
+      ? response.answer.trim()
+      : NO_ANSWER;
+
+  return {
+    payload: { question, answer },
+    repairFlags,
+  };
+}
+
+function shouldRetryWithoutJsonMode(status: number, bodyText: string) {
+  if (status < 400 || status >= 500) {
+    return false;
+  }
+
+  const normalized = bodyText.toLowerCase();
+  return (
+    normalized.includes("response_format") ||
+    normalized.includes("json_object") ||
+    normalized.includes("unsupported") ||
+    normalized.includes("not support") ||
+    normalized.includes("invalid parameter") ||
+    normalized.includes("invalid_request_error")
+  );
+}
+
+async function runUpstreamAttempt(
+  question: string,
+  requestId: string,
+  mode: UpstreamMode
+): Promise<AttemptResult> {
+  const body = buildOpenAIRequest(question, mode);
+  const startedAt = Date.now();
+
+  log("INFO", "upstream_request_started", {
+    requestId,
+    mode,
+    model: OPENAI_MODEL,
+    questionLength: question.length,
+    questionPreview: previewText(question, 120),
+  });
+
+  let response: Response;
+
+  try {
+    response = await fetch(OPENAI_BASE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error: any) {
+    const durationMs = Date.now() - startedAt;
+    return {
+      ok: false,
+      mode,
+      category: "transport_error",
+      durationMs,
+      details: error?.message || "upstream transport error",
+      shouldRetryFallback: false,
+    };
+  }
+
+  const durationMs = Date.now() - startedAt;
+  const responseText = await response.text();
+
+  log("INFO", "upstream_response_received", {
+    requestId,
+    mode,
+    status: response.status,
+    durationMs,
+    bodyLength: responseText.length,
+  });
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      mode,
+      category: "upstream_http_error",
+      status: response.status,
+      durationMs,
+      details: previewText(responseText, 240),
+      shouldRetryFallback:
+        mode === "json" && shouldRetryWithoutJsonMode(response.status, responseText),
+      rawPreview: previewText(responseText, 240),
+    };
+  }
+
+  let openaiData: any;
+
+  try {
+    openaiData = JSON.parse(responseText);
+  } catch (error: any) {
+    return {
+      ok: false,
+      mode,
+      category: "invalid_json",
+      status: response.status,
+      durationMs,
+      details: `upstream payload is not valid JSON: ${error?.message || "unknown error"}`,
+      shouldRetryFallback: mode === "json",
+      rawPreview: previewText(responseText, 240),
+    };
+  }
+
+  const extracted = extractUpstreamContent(openaiData);
+
+  log("INFO", "upstream_content_extracted", {
+    requestId,
+    mode,
+    finishReason: extracted.finishReason || "unknown",
+    contentType: extracted.contentType,
+    usage: openaiData?.usage,
+  });
+
+  if (!extracted.rawText) {
+    return {
+      ok: false,
+      mode,
+      category: "empty_content",
+      finishReason: extracted.finishReason,
+      status: response.status,
+      durationMs,
+      details: "upstream returned no text content",
+      shouldRetryFallback: mode === "json",
+    };
+  }
+
+  try {
+    const { payload, repairFlags } = parseAnswerPayload(extracted.rawText, question);
+    return {
+      ok: true,
+      mode,
+      payload,
+      finishReason: extracted.finishReason,
+      repairFlags,
+      rawPreview: previewText(extracted.rawText, 240),
+      status: response.status,
+      durationMs,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      mode,
+      category: "invalid_payload",
+      finishReason: extracted.finishReason,
+      repairFlags: sanitizeModelResponse(extracted.rawText).repairFlags,
+      rawPreview: previewText(extracted.rawText, 240),
+      status: response.status,
+      durationMs,
+      details: error?.message || "failed to parse model response",
+      shouldRetryFallback: mode === "json",
+    };
+  }
+}
+
+async function getAnswerFromUpstream(question: string, requestId: string) {
+  const firstAttempt = await runUpstreamAttempt(question, requestId, "json");
+
+  if (firstAttempt.ok) {
+    return {
+      payload: firstAttempt.payload,
+      mode: firstAttempt.mode,
+      degraded: false,
+    };
+  }
+
+  log("WARN", "upstream_attempt_failed", {
+    requestId,
+    mode: firstAttempt.mode,
+    category: firstAttempt.category,
+    finishReason: firstAttempt.finishReason || "unknown",
+    status: firstAttempt.status || null,
+    durationMs: firstAttempt.durationMs,
+    rawPreview: firstAttempt.rawPreview || null,
+    repairFlags: firstAttempt.repairFlags || null,
+    details: firstAttempt.details,
+    retryingFallback: firstAttempt.shouldRetryFallback,
+  });
+
+  if (firstAttempt.shouldRetryFallback) {
+    const secondAttempt = await runUpstreamAttempt(question, requestId, "fallback");
+
+    if (secondAttempt.ok) {
+      return {
+        payload: secondAttempt.payload,
+        mode: secondAttempt.mode,
+        degraded: false,
+      };
+    }
+
+    log("ERROR", "upstream_attempt_failed", {
+      requestId,
+      mode: secondAttempt.mode,
+      category: secondAttempt.category,
+      finishReason: secondAttempt.finishReason || "unknown",
+      status: secondAttempt.status || null,
+      durationMs: secondAttempt.durationMs,
+      rawPreview: secondAttempt.rawPreview || null,
+      repairFlags: secondAttempt.repairFlags || null,
+      details: secondAttempt.details,
+      retryingFallback: false,
+    });
+  }
+
+  return {
+    payload: createFallbackPayload(question),
+    mode: "fallback" as UpstreamMode,
+    degraded: true,
   };
 }
 
@@ -52,341 +553,116 @@ serve({
   port: PORT,
   async fetch(req: Request) {
     const url = new URL(req.url);
-    const clientIP = req.headers.get('x-forwarded-for') || 
-                     req.headers.get('x-real-ip') || 
-                     'Unknown';
+    const requestId = crypto.randomUUID();
+    const clientIp = getClientIp(req);
 
-    logRequestDetails(req, clientIP);
+    log("INFO", "request_received", {
+      requestId,
+      method: req.method,
+      path: url.pathname,
+      clientIp,
+      userAgent: previewText(req.headers.get("User-Agent") || "Unknown", 120),
+    });
 
     if (req.method === "OPTIONS") {
-      console.log(`✅ [${getTimestamp()}] 处理 OPTIONS 预检请求`);
       return new Response(null, {
         status: 200,
-        headers: getCorsHeaders()
+        headers: getCorsHeaders(),
       });
     }
 
     if (url.pathname === "/" && (req.method === "GET" || req.method === "HEAD")) {
-      console.log(`🏠 [${getTimestamp()}] 处理根路径请求 (${req.method})`);
-      
-      const responseData = { 
-        message: "Bun OpenAI AI 题库服务器运行正常",
-        version: "1.0.0",
+      const responseData = {
+        message: "OCS AI Answer service is running.",
+        version: "1.1.0",
         endpoints: ["/answer"],
         status: "running",
-        model_in_use: OPENAI_MODEL
+        modelInUse: OPENAI_MODEL,
       };
-      
-      return new Response(
-        req.method === "HEAD" ? null : JSON.stringify(responseData),
-        { 
-          status: 200, 
-          headers: { 
-            "Content-Type": "application/json",
-            ...getCorsHeaders()
-          }
-        }
+
+      return new Response(req.method === "HEAD" ? null : JSON.stringify(responseData), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          ...getCorsHeaders(),
+        },
+      });
+    }
+
+    if (url.pathname !== "/answer" || req.method !== "POST") {
+      return jsonResponse(
+        {
+          message: "API path not found",
+          availablePaths: ["/", "/answer"],
+          method: req.method,
+          path: url.pathname,
+        },
+        404
       );
     }
 
-    if (url.pathname === "/answer" && req.method === "POST") {
-      try {
-        console.log(`🤖 [${getTimestamp()}] 开始处理答案请求`);
-        
-        let requestBody;
-        try {
-          requestBody = await req.text();
-          console.log(`📋 [${getTimestamp()}] 请求体 (raw): ${requestBody}`);
-        } catch (bodyError: any) {
-          console.error(`❌ [${getTimestamp()}] 无法读取请求体:`, bodyError.message);
-          return new Response(
-            JSON.stringify({ error: "无法读取请求体", details: bodyError.message }),
-            { 
-              status: 400, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
+    let requestBody = "";
 
-        let questionData;
-        try {
-          questionData = JSON.parse(requestBody);
-          console.log(`🔍 [${getTimestamp()}] 解析后的请求数据:`, questionData);
-        } catch (jsonError: any) {
-          console.error(`❌ [${getTimestamp()}] JSON 解析失败:`, jsonError.message);
-          return new Response(
-            JSON.stringify({ error: "JSON 格式错误", details: jsonError.message }),
-            { 
-              status: 400, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        const { question } = questionData;
-
-        if (!question) {
-          console.error(`❌ [${getTimestamp()}] 缺少 'question' 字段`);
-          return new Response(
-            JSON.stringify({ error: "缺少 'question' 字段" }),
-            { 
-              status: 400, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        console.log(`💬 [${getTimestamp()}] 处理问题: "${question}"`);
-
-        const openaiRequestBody = {
-          model: OPENAI_MODEL,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: question },
-          ],
-          response_format: { type: "json_object" },
-          temperature: 0.7,
-          max_tokens: 500,
-        };
-
-        console.log(`🔄 [${getTimestamp()}] 发送到 OpenAI:`, {
-          url: OPENAI_BASE_URL,
-          model: openaiRequestBody.model,
-          messageCount: openaiRequestBody.messages.length,
-          question: question.substring(0, 100) + (question.length > 100 ? "..." : "")
-        });
-
-        let openaiResponse;
-        const fetchStartTime = Date.now();
-        
-        try {
-          openaiResponse = await fetch(OPENAI_BASE_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify(openaiRequestBody),
-          });
-          
-          const fetchDuration = Date.now() - fetchStartTime;
-          console.log(`⏱️ [${getTimestamp()}] OpenAI 请求耗时: ${fetchDuration}ms`);
-          console.log(`📡 [${getTimestamp()}] OpenAI 响应状态: ${openaiResponse.status} ${openaiResponse.statusText}`);
-          
-        } catch (fetchError: any) {
-          console.error(`❌ [${getTimestamp()}] OpenAI API 请求失败:`, {
-            message: fetchError.message,
-            cause: fetchError.cause,
-            stack: fetchError.stack
-          });
-          
-          return new Response(
-            JSON.stringify({
-              error: "OpenAI API 请求失败",
-              details: fetchError.message,
-              type: "FETCH_ERROR"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        if (!openaiResponse.ok) {
-          let errorText;
-          try {
-            errorText = await openaiResponse.text();
-            console.error(`❌ [${getTimestamp()}] OpenAI API 错误响应:`, {
-              status: openaiResponse.status,
-              statusText: openaiResponse.statusText,
-              headers: Object.fromEntries(openaiResponse.headers),
-              body: errorText
-            });
-          } catch (readError: any) {
-            console.error(`❌ [${getTimestamp()}] 无法读取 OpenAI 错误响应:`, readError.message);
-            errorText = "无法读取错误详情";
-          }
-          
-          return new Response(
-            JSON.stringify({
-              error: "OpenAI API 返回错误",
-              statusCode: openaiResponse.status,
-              statusText: openaiResponse.statusText,
-              details: errorText,
-              type: "OPENAI_ERROR"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        let openaiData;
-        try {
-          openaiData = await openaiResponse.json();
-          console.log(`📄 [${getTimestamp()}] OpenAI 响应数据:`, {
-            choices: openaiData.choices?.length || 0,
-            usage: openaiData.usage,
-            model: openaiData.model
-          });
-        } catch (parseError: any) {
-          console.error(`❌ [${getTimestamp()}] OpenAI 响应 JSON 解析失败:`, parseError.message);
-          return new Response(
-            JSON.stringify({
-              error: "OpenAI 响应解析失败",
-              details: parseError.message,
-              type: "PARSE_ERROR"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        const rawResponse = openaiData.choices?.[0]?.message?.content;
-
-        if (!rawResponse) {
-          console.error(`❌ [${getTimestamp()}] OpenAI 响应中没有内容:`, openaiData);
-          return new Response(
-            JSON.stringify({ 
-              error: "OpenAI 响应中没有内容",
-              openai_response: openaiData,
-              type: "NO_CONTENT"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        console.log(`🎯 [${getTimestamp()}] OpenAI 原始回复: ${rawResponse}`);
-
-        let aiResponse;
-        try {
-          aiResponse = JSON.parse(rawResponse);
-          console.log(`✨ [${getTimestamp()}] 解析后的 AI 响应:`, aiResponse);
-        } catch (jsonError: any) {
-          console.error(`❌ [${getTimestamp()}] AI 响应 JSON 解析失败:`, {
-            error: jsonError.message,
-            rawResponse: rawResponse
-          });
-          return new Response(
-            JSON.stringify({
-              error: "AI 回复格式错误",
-              raw_response: rawResponse,
-              parse_error: jsonError.message,
-              type: "AI_RESPONSE_FORMAT_ERROR"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-        if (aiResponse.question && aiResponse.answer) {
-          console.log(`✅ [${getTimestamp()}] 成功处理请求，返回答案`);
-          return new Response(JSON.stringify(aiResponse), {
-            status: 200,
-            headers: { 
-              "Content-Type": "application/json",
-              ...getCorsHeaders()
-            }
-          });
-        } else {
-          console.error(`❌ [${getTimestamp()}] AI 响应缺少必要字段:`, {
-            hasQuestion: !!aiResponse.question,
-            hasAnswer: !!aiResponse.answer,
-            response: aiResponse
-          });
-          return new Response(
-            JSON.stringify({
-              error: "AI 响应格式不完整",
-              expected: ["question", "answer"],
-              received: Object.keys(aiResponse),
-              ai_response: aiResponse,
-              type: "INCOMPLETE_RESPONSE"
-            }),
-            { 
-              status: 500, 
-              headers: { 
-                "Content-Type": "application/json",
-                ...getCorsHeaders()
-              }
-            }
-          );
-        }
-
-      } catch (error: any) {
-        console.error(`❌ [${getTimestamp()}] 服务器内部错误:`, {
-          message: error.message,
-          stack: error.stack,
-          name: error.name,
-          cause: error.cause
-        });
-        
-        return new Response(
-          JSON.stringify({
-            error: "服务器内部错误",
-            details: error.message,
-            type: "INTERNAL_ERROR"
-          }),
-          { 
-            status: 500, 
-            headers: { 
-              "Content-Type": "application/json",
-              ...getCorsHeaders()
-            }
-          }
-        );
-      }
+    try {
+      requestBody = await req.text();
+    } catch (error: any) {
+      log("ERROR", "request_body_read_failed", {
+        requestId,
+        details: error?.message || "failed to read body",
+      });
+      return jsonResponse({ error: "无法读取请求体" }, 400);
     }
 
-    console.log(`❓ [${getTimestamp()}] 未知路径: ${url.pathname}`);
-    return new Response(
-      JSON.stringify({ 
-        message: "API 路径不存在",
-        available_paths: ["/", "/answer"],
-        method: req.method,
-        path: url.pathname
-      }),
-      { 
-        status: 404, 
-        headers: { 
-          "Content-Type": "application/json",
-          ...getCorsHeaders()
-        }
-      }
-    );
+    let questionData: any;
+
+    try {
+      questionData = JSON.parse(requestBody);
+    } catch (error: any) {
+      log("WARN", "request_body_invalid_json", {
+        requestId,
+        bodyPreview: previewText(requestBody, 240),
+        details: error?.message || "invalid JSON body",
+      });
+      return jsonResponse({ error: "JSON 格式错误" }, 400);
+    }
+
+    const question =
+      typeof questionData?.question === "string" ? questionData.question.trim() : "";
+
+    if (!question) {
+      log("WARN", "request_question_missing", {
+        requestId,
+        receivedKeys:
+          questionData && typeof questionData === "object"
+            ? Object.keys(questionData)
+            : [],
+      });
+      return jsonResponse({ error: "缺少 'question' 字段" }, 400);
+    }
+
+    log("INFO", "answer_request_validated", {
+      requestId,
+      questionLength: question.length,
+      questionPreview: previewText(question, 120),
+    });
+
+    try {
+      const result = await getAnswerFromUpstream(question, requestId);
+
+      log(result.degraded ? "WARN" : "INFO", "answer_response_ready", {
+        requestId,
+        mode: result.mode,
+        degraded: result.degraded,
+        answerPreview: previewText(result.payload.answer, 120),
+      });
+
+      return jsonResponse(result.payload, 200);
+    } catch (error: any) {
+      log("ERROR", "answer_request_failed", {
+        requestId,
+        details: error?.message || "unexpected internal error",
+      });
+      return jsonResponse(createFallbackPayload(question), 200);
+    }
   },
 });
-
-console.log(`🎉 服务器启动成功！访问 http://localhost:${PORT} 查看状态`);

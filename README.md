@@ -1,69 +1,88 @@
 # OCS AI Answer Service
 
-代理 OpenAI 兼容的对话模型，用于[OCS 网课助手](https://docs.ocsjs.com)的题库。
+An OpenAI-compatible answer proxy for [OCS](https://docs.ocsjs.com) question-bank integration.
 
-## ✨ 核心特性
+## For AI Agents
+See [AGENT_README.md](./AGENT_README.md) for operational context.
 
--   **Bun 原生 HTTP 服务**：性能优异，日志详细。
--   **固定 JSON 返回**：输出 `{"question":"...","answer":"..."}`，无需额外适配。
--   **部署便捷**：支持 Dockerfile、Docker Compose 部署，并自带 GitHub Actions 自动化构建与推送 GHCR 镜像。
--   **默认开启 CORS**：方便浏览器直接调用。
+## Core Features
 
-## 🚀 快速上手
+- Bun-native HTTP service with line-oriented structured logs.
+- JSON-first upstream requests with automatic fallback when `response_format` is unsupported.
+- Stable output contract: `{"question":"...","answer":"..."}`.
+- Response repair for common malformed outputs such as fenced JSON and trailing prose.
+- Graceful degradation to `"无法找到答案"` instead of surfacing opaque upstream formatting failures to OCS.
+- Dockerfile and Docker Compose deployment support.
 
-### 📦 环境准备
+## Quickstart
 
-1.  安装 [Bun](https://bun.sh/) ≥ 1.1。
-2.  复制 `.env.example` 到 `.env`，并配置以下关键环境变量：
-    -   `OPENAI_API_KEY` (必填): OpenAI 或兼容服务的密钥。
-    -   `OPENAI_BASE_URL` (选填): 自建或代理网关地址。
-    -   `OPENAI_MODEL` (选填): 可用模型，如 `gpt-4o-mini`。
-    -   `SYSTEM_PROMPT` (选填): 用于约束模型输出 JSON 格式。
-    -   `PORT` (选填): 服务端口，默认 `3000`。
+### Prerequisites
 
-### 🏃 本地运行
+1. Install Bun 1.1 or later.
+2. Copy `.env.example` to `.env`.
+3. Set at least:
+   - `OPENAI_API_KEY`
+   - `OPENAI_BASE_URL` if you use a proxy or gateway
+   - `OPENAI_MODEL`
+
+### Run locally
 
 ```bash
 bun install
 bun run index.ts
 ```
 
-服务将监听 `http://localhost:3000`。向 `/answer` 发送 `{"question":"..."}` 的 POST 请求即可获取答案。
+The service listens on `http://localhost:3000`.
 
-### 🐳 Docker Compose 部署
+### Minimal request
 
-确保 `.env` 配置无误后，执行：
+```bash
+curl -X POST http://localhost:3000/answer \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"下列关于家庭表述中，不正确的是（）。"}'
+```
+
+Expected shape:
+
+```json
+{
+  "question": "下列关于家庭表述中，不正确的是（）。",
+  "answer": "无法找到答案"
+}
+```
+
+### Docker Compose
 
 ```bash
 docker compose up -d
 ```
 
-### 🔗 OCS 题库插件配置示例
+## OCS Configuration Example
 
-将以下 JSON 配置加入你的 OCS 题库客户端，替换 `homepage` 和 `url` 中的 IP 为实际部署地址：
+Replace the host in `homepage` and `url` with your deployment address:
 
 ```json
 [
   {
     "name": "OCS-AI-ANSWER",
-    "homepage": "http://你的服务IP:3000/",
-    "url": "http://你的服务IP:3000/answer",
+    "homepage": "http://your-host:3000/",
+    "url": "http://your-host:3000/answer",
     "method": "post",
     "type": "GM_xmlhttpRequest",
     "contentType": "json",
     "data": { "question": "${title}" },
     "headers": { "Content-Type": "application/json" },
-    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } else if (res && res.error) { return ['AI题库错误: ' + res.error, undefined]; } return undefined; }"
+    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
   }
 ]
 ```
 
-## 🛡️ 安全提示
+## Configuration Notes
 
--   确保 `.env` 文件和敏感日志未被提交到版本控制。
--   定期检查并轮换 API Key，防止滥用。
--   根据需求调整 `SYSTEM_PROMPT`，保持对模型输出的控制。
+- `SYSTEM_PROMPT` should stay short and contract-focused.
+- The service does not send `max_tokens`, `temperature`, or similar sampling controls.
+- Recoverable upstream failures degrade to a valid answer payload with `"无法找到答案"`.
 
-## 📄 开源许可
+## Help
 
-本项目采用 [MIT License](LICENSE)。欢迎使用、修改和分发。
+Open an issue in the repository if you need a new compatibility path for a specific upstream provider.
