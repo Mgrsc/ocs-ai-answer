@@ -49,8 +49,12 @@
   { "question": "...", "answer": "..." }
   ```
 - Client errors:
+  - suspicious scanner path or blocked IP -> `403` with JSON `{ "error": "Access denied" }`
+  - rapid request rate exceeding limit -> `429` with JSON `{ "error": "Too Many Requests" }` and `Retry-After` header
+  - unauthorized request when `CLIENT_API_KEY` is configured -> `401` with JSON `{ "error": "未提供有效鉴权 Token" }`
   - invalid JSON body -> `400`
   - missing or empty `question` -> `400`
+  - unknown endpoint path -> `404` with generic JSON `{ "error": "Not Found" }`
   - request body exceeds 16MB -> `413` with JSON `{ "error": "请求体过大" }` and CORS headers (runtime hard limit 32MB)
 - Image upload limits (both direct Base64 and downloaded):
   - maximum 4 images per request
@@ -72,6 +76,10 @@
   - optional
   - default: `gpt-4o-mini`
   - wrong value usually causes upstream 4xx or empty provider responses
+- `CLIENT_API_KEY`
+  - optional
+  - if set, `POST /answer` enforces `Authorization: Bearer <CLIENT_API_KEY>` or `X-API-Key: <CLIENT_API_KEY>`
+  - unauthenticated requests receive `401`
 - `SYSTEM_PROMPT`
   - optional
   - when unset, the service uses a built-in default prompt with OCS-oriented rules for single, multiple, and judgement questions
@@ -90,6 +98,18 @@
   - optional
   - default: unset (allows any public host protected by default SSRF IP defenses)
   - optional comma-separated host patterns (e.g. `*.chaoxing.com,*.ananas.chaoxing.com`) to restrict outgoing image downloads
+- `RATE_LIMIT_PER_MINUTE`
+  - optional
+  - default: `60`
+  - maximum requests allowed per IP per minute (range: `0` to `10000`, set to `0` to disable rate limiting)
+- `IP_BLOCK_DURATION_MS`
+  - optional
+  - default: `3600000` (1 hour)
+  - duration in milliseconds to jail IPs triggering scanner traps (range: `1000` to `2592000000` = 30 days)
+- `TRUST_PROXY`
+  - optional
+  - default: `false`
+  - when true, respects `X-Forwarded-For` (rightmost hop) and `X-Real-IP` from a single trusted reverse proxy like Nginx (IPv4-mapped and canonical IPv6 addresses are strictly normalized); note: when enabling `TRUST_PROXY`, direct public access to port 3000 must be forbidden (e.g. bind `"127.0.0.1:3000:3000"` in `compose.yaml` or restrict via firewall); when false, only trusts direct socket IP addresses from Bun
 
 ## Startup And Deployment
 
@@ -101,7 +121,7 @@
 - Container startup:
   - keep `.env` next to `compose.yaml`
   - run `docker compose up -d`
-- The service has no external state and no database dependency.
+- The service has no external state and no database dependency (IP jail and rate-limiting registries reside in process memory and reset upon restart).
 
 ## Logging
 
@@ -109,6 +129,10 @@
 - Every request gets a `requestId`.
 - Key events:
   - `request_received`
+  - `scanner_path_blocked`
+  - `blocked_ip_rejected`
+  - `rate_limit_exceeded`
+  - `client_auth_failed`
   - `request_body_too_large`
   - `answer_request_validated`
   - `direct_images_processed`
@@ -179,4 +203,4 @@
 
 ## Validation Notes
 
-- Validated via `bun test` (43 tests: 42 offline unit/integration passing in ~140ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).
+- Validated via `bun test` (63 tests: 62 offline unit/integration passing in ~210ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).

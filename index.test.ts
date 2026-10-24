@@ -21,6 +21,9 @@ import {
   shouldRetryWithFallbackMode,
   isImageUnsupportedError,
   getAnswerFromUpstream,
+  extractAuthToken,
+  verifyClientToken,
+  __testing,
 } from "./index";
 
 describe("Service Version and Metadata", () => {
@@ -622,9 +625,7 @@ describe("OCS 5.x Image Optimization and v2 Contract", () => {
     console.log = (msg: any) => {
       try {
         loggedEvents.push(JSON.parse(msg));
-      } catch {
-        // ignore non-json log
-      }
+      } catch {}
     };
 
     (globalThis as any).fetch = async () => {
@@ -678,9 +679,7 @@ describe("OCS 5.x Image Optimization and v2 Contract", () => {
     console.log = (msg: any) => {
       try {
         loggedEvents.push(JSON.parse(msg));
-      } catch {
-        // ignore non-json log
-      }
+      } catch {}
     };
 
     let upstreamBody: any = null;
@@ -779,6 +778,425 @@ describe("OCS 5.x Image Optimization and v2 Contract", () => {
       expect(content[1].type).toBe("image_url");
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("Client Authentication (CLIENT_API_KEY)", () => {
+  it("should extract token from Bearer authorization or X-API-Key header", () => {
+    const req1 = new Request("http://localhost:3000/answer", {
+      headers: { authorization: "Bearer my-secret-key" },
+    });
+    expect(extractAuthToken(req1)).toBe("my-secret-key");
+
+    const req2 = new Request("http://localhost:3000/answer", {
+      headers: { authorization: "raw-token-123" },
+    });
+    expect(extractAuthToken(req2)).toBe("raw-token-123");
+
+    const req3 = new Request("http://localhost:3000/answer", {
+      headers: { "x-api-key": "api-key-456" },
+    });
+    expect(extractAuthToken(req3)).toBe("api-key-456");
+
+    const req4 = new Request("http://localhost:3000/answer");
+    expect(extractAuthToken(req4)).toBeUndefined();
+  });
+
+  it("should verify token correctly with constant-time equality", () => {
+    expect(verifyClientToken("secret123", "secret123")).toBe(true);
+    expect(verifyClientToken("wrong", "secret123")).toBe(false);
+    expect(verifyClientToken(undefined, "secret123")).toBe(false);
+    expect(verifyClientToken("secret1234", "secret123")).toBe(false);
+  });
+
+  it("should reject requests without valid token when CLIENT_API_KEY is configured", async () => {
+    __testing.setClientApiKey("test-client-secret");
+    try {
+      const unauthReq = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: "Secret Question?" }),
+      });
+      const unauthRes = await handleClientRequest(unauthReq);
+      expect(unauthRes.status).toBe(401);
+      expect(unauthRes.headers.get("access-control-allow-origin")).toBe("*");
+      const unauthJson = await unauthRes.json();
+      expect(unauthJson.error).toContain("Token");
+
+      const wrongReq = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer wrong-password",
+        },
+        body: JSON.stringify({ question: "Secret Question?" }),
+      });
+      const wrongRes = await handleClientRequest(wrongReq);
+      expect(wrongRes.status).toBe(401);
+    } finally {
+      __testing.setClientApiKey(process.env.CLIENT_API_KEY?.trim() || undefined);
+    }
+  });
+
+  it("should allow requests with valid Bearer or X-API-Key token when CLIENT_API_KEY is configured", async () => {
+    const originalFetch = globalThis.fetch;
+    __testing.setClientApiKey("test-client-secret");
+
+    (globalThis as any).fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "echo", answer: "Auth Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const bearerReq = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer test-client-secret",
+        },
+        body: JSON.stringify({ question: "Bearer Auth Question" }),
+      });
+      const bearerRes = await handleClientRequest(bearerReq);
+      expect(bearerRes.status).toBe(200);
+      const bearerJson = await bearerRes.json();
+      expect(bearerJson.answer).toBe("Auth Answer");
+
+      const apiKeyReq = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": "test-client-secret",
+        },
+        body: JSON.stringify({ question: "API Key Auth Question" }),
+      });
+      const apiKeyRes = await handleClientRequest(apiKeyReq);
+      expect(apiKeyRes.status).toBe(200);
+      const apiKeyJson = await apiKeyRes.json();
+      expect(apiKeyJson.answer).toBe("Auth Answer");
+    } finally {
+      globalThis.fetch = originalFetch;
+      __testing.setClientApiKey(process.env.CLIENT_API_KEY?.trim() || undefined);
+    }
+  });
+
+  it("should keep health-check probes accessible without token even when CLIENT_API_KEY is configured", async () => {
+    __testing.setClientApiKey("test-client-secret");
+    try {
+      const headReq = new Request("http://localhost:3000/answer?t=123", {
+        method: "HEAD",
+      });
+      const headRes = await handleClientRequest(headReq);
+      expect(headRes.status).toBe(200);
+
+      const getReq = new Request("http://localhost:3000/answer?t=123", {
+        method: "GET",
+      });
+      const getRes = await handleClientRequest(getReq);
+      expect(getRes.status).toBe(200);
+    } finally {
+      __testing.setClientApiKey(process.env.CLIENT_API_KEY?.trim() || undefined);
+    }
+  });
+});
+
+describe("Anti-Scanner and Abuse Defense (IP Jail, Path Traps, and Rate Limiting)", () => {
+  it("should detect suspicious scanner paths correctly", () => {
+    expect(__testing.isSuspiciousScannerPath("/.env")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/.env.local")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/app/.env")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/.git/config")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/wp-admin/index.php")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/phpmyadmin/")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/actuator/health")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/index.php")).toBe(true);
+    expect(__testing.isSuspiciousScannerPath("/shell.sh")).toBe(true);
+
+    expect(__testing.isSuspiciousScannerPath("/")).toBe(false);
+    expect(__testing.isSuspiciousScannerPath("/answer")).toBe(false);
+    expect(__testing.isSuspiciousScannerPath("/answer?t=123456")).toBe(false);
+  });
+
+  it("should block suspicious paths with 403 and automatically jail the offending IP", async () => {
+    __testing.resetSecurityState();
+    const attackerIp = "34.32.44.30";
+    const mockServer = { requestIP: () => ({ address: attackerIp }) };
+
+    const scanReq = new Request("http://localhost:3000/.env");
+    const scanRes = await handleClientRequest(scanReq, mockServer);
+    expect(scanRes.status).toBe(403);
+    const scanJson = await scanRes.json();
+    expect(scanJson.error).toBe("Access denied");
+
+    const normalReq = new Request("http://localhost:3000/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "Hello" }),
+    });
+    const normalRes = await handleClientRequest(normalReq, mockServer);
+    expect(normalRes.status).toBe(403);
+
+    const innocentServer = { requestIP: () => ({ address: "198.51.100.1" }) };
+    const innocentReq = new Request("http://localhost:3000/answer?t=123", {
+      method: "HEAD",
+    });
+    const innocentRes = await handleClientRequest(innocentReq, innocentServer);
+    expect(innocentRes.status).toBe(200);
+
+    __testing.resetSecurityState();
+  });
+
+  it("should rate limit rapid POST requests and return 429 with Retry-After header", async () => {
+    __testing.resetSecurityState();
+    const spamIp = "192.0.2.88";
+    const now = Date.now();
+
+    for (let i = 0; i < 3; i++) {
+      const res = __testing.checkRateLimit(spamIp, now, 3);
+      expect(res.allowed).toBe(true);
+    }
+
+    const exceeded = __testing.checkRateLimit(spamIp, now, 3);
+    expect(exceeded.allowed).toBe(false);
+    expect(exceeded.retryAfterSeconds).toBeGreaterThan(0);
+
+    __testing.resetSecurityState();
+  });
+
+  it("should keep health probes accessible even under high frequency without triggering 429", async () => {
+    __testing.resetSecurityState();
+    const probeServer = { requestIP: () => ({ address: "192.0.2.99" }) };
+
+    for (let i = 0; i < 100; i++) {
+      const headReq = new Request("http://localhost:3000/answer?t=123", {
+        method: "HEAD",
+      });
+      const headRes = await handleClientRequest(headReq, probeServer);
+      expect(headRes.status).toBe(200);
+    }
+
+    __testing.resetSecurityState();
+  });
+
+  it("should bound capacity strictly with O(1) LRU eviction preventing CPU lockup", () => {
+    __testing.resetSecurityState();
+    const now = Date.now();
+
+    const start = performance.now();
+    for (let i = 0; i < 15000; i++) {
+      __testing.checkRateLimit(`10.0.${Math.floor(i / 256)}.${i % 256}`, now);
+    }
+    const elapsed = performance.now() - start;
+
+    expect(elapsed).toBeLessThan(1000);
+    expect(__testing.getTrackedIpsCount()).toBeLessThanOrEqual(10000);
+
+    __testing.resetSecurityState();
+  });
+
+  it("should respect unforgeable socket IP and ignore client XFF headers when TRUST_PROXY is false", () => {
+    const fakeHeaders = new Headers({
+      "x-forwarded-for": "127.0.0.1",
+      "x-real-ip": "1.1.1.1",
+    });
+    const req = new Request("http://localhost:3000/answer", { headers: fakeHeaders });
+    const mockServer = { requestIP: () => ({ address: "203.0.113.195" }) };
+
+    const resolvedIp = __testing.getClientIp(req, mockServer);
+    expect(resolvedIp).toBe("203.0.113.195");
+    expect(resolvedIp).not.toBe("127.0.0.1");
+  });
+
+  it("should return generic 404 without leaking available internal paths", async () => {
+    const notFoundReq = new Request("http://localhost:3000/some-random-page");
+    const res = await handleClientRequest(notFoundReq);
+    expect(res.status).toBe(404);
+    const json = await res.json();
+    expect(json.error).toBe("Not Found");
+    expect((json as any).availablePaths).toBeUndefined();
+    expect((json as any).message).toBeUndefined();
+  });
+
+  it("should normalize IPv4-mapped IPv6 addresses and canonicalize IPv6 variants", () => {
+    expect(__testing.normalizeIpAddress("::ffff:127.0.0.1")).toBe("127.0.0.1");
+    expect(__testing.normalizeIpAddress("::FFFF:192.0.2.1")).toBe("192.0.2.1");
+    expect(__testing.normalizeIpAddress("0:0:0:0:0:ffff:8.8.8.8")).toBe("8.8.8.8");
+    expect(__testing.normalizeIpAddress("::1")).toBe("::1");
+    expect(__testing.normalizeIpAddress("0:0:0:0:0:0:0:1")).toBe("::1");
+    expect(__testing.normalizeIpAddress("0000:0000:0000:0000:0000:0000:0000:0001")).toBe("::1");
+    expect(__testing.normalizeIpAddress("2001:0db8:0000:0000:0000:0000:1428:57ab")).toBe("2001:db8::1428:57ab");
+    expect(__testing.normalizeIpAddress("203.0.113.1")).toBe("203.0.113.1");
+  });
+
+  it("should extract trusted client IP and normalize addresses when TRUST_PROXY is true", () => {
+    __testing.setTrustProxy(true);
+
+    const multiHopHeaders = new Headers({
+      "x-forwarded-for": "203.0.113.10, ::ffff:198.51.100.25",
+    });
+    const multiHopReq = new Request("http://localhost:3000/answer", { headers: multiHopHeaders });
+    expect(__testing.getClientIp(multiHopReq)).toBe("198.51.100.25");
+
+    const realIpHeaders = new Headers({
+      "x-real-ip": "::ffff:192.0.2.55",
+    });
+    const realIpReq = new Request("http://localhost:3000/answer", { headers: realIpHeaders });
+    expect(__testing.getClientIp(realIpReq)).toBe("192.0.2.55");
+
+    const directReq = new Request("http://localhost:3000/answer");
+    const mockServer = { requestIP: () => ({ address: "::ffff:10.0.0.1" }) };
+    expect(__testing.getClientIp(directReq, mockServer)).toBe("10.0.0.1");
+
+    __testing.setTrustProxy(false);
+  });
+
+  it("should isolate jailed IPs from rate limit eviction", () => {
+    __testing.resetSecurityState();
+    const now = Date.now();
+    const maliciousIp = "34.32.44.30";
+
+    __testing.blockIp(maliciousIp, now);
+    expect(__testing.isIpBlocked(maliciousIp, now)).toBe(true);
+
+    for (let i = 0; i < 15000; i++) {
+      __testing.checkRateLimit(`10.1.${Math.floor(i / 256)}.${i % 256}`, now);
+    }
+
+    expect(__testing.getTrackedIpsCount()).toBeLessThanOrEqual(10000);
+    expect(__testing.isIpBlocked(maliciousIp, now)).toBe(true);
+    expect(__testing.getBlockedIpsCount()).toBe(1);
+
+    __testing.resetSecurityState();
+  });
+
+  async function withRateLimit(limit: number, fn: () => Promise<void> | void) {
+    __testing.resetSecurityState();
+    const initialLimit = __testing.getRateLimitPerMinute();
+    try {
+      __testing.setRateLimitPerMinute(limit);
+      await fn();
+    } finally {
+      __testing.setRateLimitPerMinute(initialLimit);
+      __testing.resetSecurityState();
+    }
+  }
+
+  it("should disable rate limiting when RATE_LIMIT_PER_MINUTE is set to 0", async () => {
+    await withRateLimit(0, () => {
+      const testIp = "192.0.2.100";
+      const now = Date.now();
+      for (let i = 0; i < 120; i++) {
+        const res = __testing.checkRateLimit(testIp, now);
+        expect(res.allowed).toBe(true);
+      }
+    });
+  });
+
+  it("should rate limit rapid requests to unknown 404 paths and return 429", async () => {
+    await withRateLimit(3, async () => {
+      const spamServer = { requestIP: () => ({ address: "192.0.2.77" }) };
+
+      for (let i = 0; i < 3; i++) {
+        const notFoundReq = new Request(`http://localhost:3000/random-path-${i}`);
+        const res = await handleClientRequest(notFoundReq, spamServer);
+        expect(res.status).toBe(404);
+      }
+
+      const exceededReq = new Request("http://localhost:3000/random-path-exceeded");
+      const exceededRes = await handleClientRequest(exceededReq, spamServer);
+      expect(exceededRes.status).toBe(429);
+      const json = await exceededRes.json();
+      expect(json.error).toBe("Too Many Requests");
+      expect(exceededRes.headers.get("Retry-After")).toBeDefined();
+    });
+  });
+
+  it("should return 429 with CORS headers on /answer when handleClientRequest rate limit is exceeded", async () => {
+    const originalFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            { message: { content: JSON.stringify({ question: "Test", answer: "OK" }) } },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+
+    try {
+      await withRateLimit(2, async () => {
+        const spamServer = { requestIP: () => ({ address: "192.0.2.66" }) };
+
+        for (let i = 0; i < 2; i++) {
+          const req = new Request("http://localhost:3000/answer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question: "Test" }),
+          });
+          const res = await handleClientRequest(req, spamServer);
+          expect(res.status).toBe(200);
+        }
+
+        const blockedReq = new Request("http://localhost:3000/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: "Test" }),
+        });
+        const blockedRes = await handleClientRequest(blockedReq, spamServer);
+        expect(blockedRes.status).toBe(429);
+        expect(blockedRes.headers.get("Access-Control-Allow-Origin")).toBe("*");
+        expect(blockedRes.headers.get("Retry-After")).toBeDefined();
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("should parse integer within range and clamp out of range values to boundary limits or fallback", () => {
+    expect(__testing.parseIntInRange("10", 60, 0, 100)).toBe(10);
+    expect(__testing.parseIntInRange("0", 60, 0, 100)).toBe(0);
+    expect(__testing.parseIntInRange("-1", 60, 0, 100)).toBe(0);
+    expect(__testing.parseIntInRange("200", 60, 0, 100)).toBe(100);
+    expect(__testing.parseIntInRange("abc", 60, 0, 100)).toBe(60);
+    expect(__testing.parseIntInRange(undefined, 60, 0, 100)).toBe(60);
+
+    expect(__testing.parseIntInRange("0", 3000, 1, 65535, "fallback")).toBe(3000);
+    expect(__testing.parseIntInRange("-5", 3000, 1, 65535, "fallback")).toBe(3000);
+    expect(__testing.parseIntInRange("70000", 3000, 1, 65535, "fallback")).toBe(3000);
+    expect(__testing.parseIntInRange("8080", 3000, 1, 65535, "fallback")).toBe(8080);
+  });
+
+  it("should throttle scanner_path_blocked logs when client IP is Unknown", async () => {
+    __testing.resetSecurityState();
+    const originalConsoleLog = console.log;
+    const loggedEvents: any[] = [];
+    console.log = (msg: any) => {
+      try {
+        loggedEvents.push(JSON.parse(msg));
+      } catch {}
+    };
+
+    try {
+      for (let i = 0; i < 5; i++) {
+        const scanReq = new Request("http://localhost:3000/.env");
+        const scanRes = await handleClientRequest(scanReq);
+        expect(scanRes.status).toBe(403);
+      }
+      const scannerLogs = loggedEvents.filter((e) => e.event === "scanner_path_blocked");
+      expect(scannerLogs.length).toBe(1);
+    } finally {
+      console.log = originalConsoleLog;
+      __testing.resetSecurityState();
     }
   });
 });

@@ -1,11 +1,18 @@
-import { serve } from "bun";
+import { serve, type Server } from "bun";
 import "dotenv/config";
+import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
 import packageJson from "./package.json";
 
 const SERVICE_VERSION = packageJson.version || "1.2.0";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const CLIENT_API_KEY = process.env.CLIENT_API_KEY?.trim() || undefined;
+let configuredClientApiKey = CLIENT_API_KEY;
+
+function setConfiguredClientApiKey(key?: string) {
+  configuredClientApiKey = key ? key.trim() : undefined;
+}
 const OPENAI_BASE_URL =
   process.env.OPENAI_BASE_URL || "https://api.openai.com/v1/chat/completions";
 const NO_ANSWER = process.env.NO_ANSWER || "不知道";
@@ -13,7 +20,24 @@ const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   `Return exactly one JSON object with two string fields: "question" and "answer". Copy the user question exactly into "question". Put only the final answer into "answer". If the answer cannot be determined, set "answer" to "${NO_ANSWER}". For single-choice and judgement questions, answer with exactly one provided option. For multiple-choice questions, return all correct options joined by "#", preserving the original option text order from the user input. Do not output markdown, code fences, explanations, or extra keys.`;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const PORT = Number(process.env.PORT || 3000);
+function parseIntInRange(
+  val: string | undefined,
+  defaultVal: number,
+  min: number,
+  max: number,
+  mode: "clamp" | "fallback" = "clamp"
+): number {
+  if (!val) return defaultVal;
+  const num = Number(val.trim());
+  if (!Number.isFinite(num)) return defaultVal;
+  const floored = Math.floor(num);
+  if (floored < min || floored > max) {
+    return mode === "clamp" ? Math.min(max, Math.max(min, floored)) : defaultVal;
+  }
+  return floored;
+}
+
+const PORT = parseIntInRange(process.env.PORT, 3000, 1, 65535, "fallback");
 const DEBUG_REQUEST_DETAILS =
   process.env.DEBUG_REQUEST_DETAILS === "1" ||
   process.env.DEBUG_REQUEST_DETAILS === "true";
@@ -36,6 +60,35 @@ const ALLOWED_IMAGE_HOSTS_RAW = process.env.ALLOWED_IMAGE_HOSTS;
 const ALLOWED_IMAGE_HOSTS = ALLOWED_IMAGE_HOSTS_RAW
   ? ALLOWED_IMAGE_HOSTS_RAW.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean)
   : undefined;
+const RATE_LIMIT_PER_MINUTE = parseIntInRange(
+  process.env.RATE_LIMIT_PER_MINUTE,
+  60,
+  0,
+  10000
+);
+let configuredRateLimitPerMinute = RATE_LIMIT_PER_MINUTE;
+const IP_BLOCK_DURATION_MS = parseIntInRange(
+  process.env.IP_BLOCK_DURATION_MS,
+  60 * 60 * 1000,
+  1000,
+  30 * 24 * 60 * 60 * 1000
+);
+const MAX_TRACKED_IPS = 10000;
+const TRUST_PROXY =
+  process.env.TRUST_PROXY === "1" ||
+  process.env.TRUST_PROXY === "true";
+let configuredTrustProxy = TRUST_PROXY;
+
+function setConfiguredTrustProxy(enabled: boolean) {
+  configuredTrustProxy = enabled;
+}
+
+function setConfiguredRateLimitPerMinute(limit: number) {
+  configuredRateLimitPerMinute = Math.min(10000, Math.max(0, Math.floor(limit)));
+}
+
+const SUSPICIOUS_PATH_REGEX =
+  /(?:\/\.(?:env|git|svn|aws|ssh|config|ds_store)|\/(?:wp-admin|phpmyadmin|actuator|eval-stdin|swagger|api-docs|boaform|cgi-bin)|\.(?:php|asp|aspx|jsp|cgi|sh|py|pl|lua|action)(?:$|\?))/i;
 
 if (import.meta.main) {
   if (!OPENAI_API_KEY) {
@@ -59,6 +112,12 @@ if (import.meta.main) {
       noAnswerText: NO_ANSWER,
       systemPromptLength: SYSTEM_PROMPT.length,
       debugRequestDetails: DEBUG_REQUEST_DETAILS,
+      authRequired: Boolean(configuredClientApiKey),
+      rateLimitPerMinute:
+        configuredRateLimitPerMinute === 0
+          ? "disabled"
+          : configuredRateLimitPerMinute,
+      trustProxy: configuredTrustProxy,
     })
   );
 }
@@ -151,9 +210,36 @@ function getCorsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-API-Key",
     "Access-Control-Max-Age": "86400",
   };
+}
+
+function extractAuthToken(req: Request): string | undefined {
+  const authHeader = req.headers.get("authorization")?.trim();
+  if (authHeader) {
+    if (authHeader.toLowerCase().startsWith("bearer ")) {
+      return authHeader.slice(7).trim();
+    }
+    return authHeader;
+  }
+  const xApiKey = req.headers.get("x-api-key")?.trim();
+  if (xApiKey) {
+    return xApiKey;
+  }
+  return undefined;
+}
+
+function verifyClientToken(providedToken: string | undefined, expectedKey: string): boolean {
+  if (!providedToken) {
+    return false;
+  }
+  const providedBuffer = Buffer.from(providedToken);
+  const expectedBuffer = Buffer.from(expectedKey);
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -173,12 +259,171 @@ function createFallbackPayload(question: string) {
   };
 }
 
-function getClientIp(req: Request) {
-  return (
-    req.headers.get("x-forwarded-for") ||
-    req.headers.get("x-real-ip") ||
-    "Unknown"
-  );
+function wordsToCanonicalIPv6(words: number[]): string {
+  let bestStart = -1;
+  let bestLen = 0;
+  let currStart = -1;
+  let currLen = 0;
+
+  for (let i = 0; i < 8; i++) {
+    if (words[i] === 0) {
+      if (currStart === -1) {
+        currStart = i;
+        currLen = 1;
+      } else {
+        currLen++;
+      }
+      if (currLen > bestLen && currLen >= 2) {
+        bestStart = currStart;
+        bestLen = currLen;
+      }
+    } else {
+      currStart = -1;
+      currLen = 0;
+    }
+  }
+
+  if (bestLen < 2) {
+    return words.map((w) => w.toString(16)).join(":");
+  }
+
+  const left = words.slice(0, bestStart).map((w) => w.toString(16)).join(":");
+  const right = words.slice(bestStart + bestLen).map((w) => w.toString(16)).join(":");
+  return `${left}::${right}`;
+}
+
+function normalizeIpAddress(ip: string): string {
+  const trimmed = ip.trim();
+  if (net.isIP(trimmed) === 4) {
+    return trimmed;
+  }
+  const words = parseIPv6Words(trimmed);
+  if (!words) {
+    return trimmed.toLowerCase();
+  }
+  if (
+    words[0] === 0 &&
+    words[1] === 0 &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0 &&
+    words[5] === 0xffff
+  ) {
+    return `${words[6] >> 8}.${words[6] & 0xff}.${words[7] >> 8}.${words[7] & 0xff}`;
+  }
+  return wordsToCanonicalIPv6(words);
+}
+
+type ServerLike = Server<unknown> | { requestIP?: (req: Request) => { address?: string } | null };
+
+function getClientIp(req: Request, server?: ServerLike): string {
+  if (configuredTrustProxy) {
+    const forwarded = req.headers.get("x-forwarded-for");
+    const rightmostXff = forwarded
+      ? forwarded.split(",").map((s) => s.trim()).filter(Boolean).pop()
+      : undefined;
+    const realIp = req.headers.get("x-real-ip")?.trim();
+
+    for (const candidate of [rightmostXff, realIp]) {
+      if (candidate) {
+        const normalized = normalizeIpAddress(candidate);
+        if (net.isIP(normalized)) {
+          return normalized;
+        }
+      }
+    }
+  }
+
+  const socketAddress = server?.requestIP?.(req);
+  if (socketAddress?.address) {
+    const normalized = normalizeIpAddress(socketAddress.address);
+    if (net.isIP(normalized)) {
+      return normalized;
+    }
+  }
+
+  return "Unknown";
+}
+
+type BlockedIpRecord = {
+  blockedUntil: number;
+  lastBlockedLogAt?: number;
+};
+
+const blockedIpRegistry = new Map<string, BlockedIpRecord>();
+const rateLimitRegistry = new Map<string, number[]>();
+let lastUnknownScannerLogAt = 0;
+
+function isSuspiciousScannerPath(pathname: string): boolean {
+  return SUSPICIOUS_PATH_REGEX.test(pathname);
+}
+
+function isIpBlocked(ip: string, now: number): boolean {
+  if (ip === "Unknown") {
+    return false;
+  }
+  const record = blockedIpRegistry.get(ip);
+  if (!record) {
+    return false;
+  }
+  if (now >= record.blockedUntil) {
+    blockedIpRegistry.delete(ip);
+    return false;
+  }
+  return true;
+}
+
+function blockIp(ip: string, now: number, durationMs = IP_BLOCK_DURATION_MS) {
+  if (ip === "Unknown") {
+    return;
+  }
+  if (blockedIpRegistry.has(ip)) {
+    blockedIpRegistry.delete(ip);
+  } else if (blockedIpRegistry.size >= MAX_TRACKED_IPS) {
+    const oldestKey = blockedIpRegistry.keys().next().value;
+    if (oldestKey !== undefined) {
+      blockedIpRegistry.delete(oldestKey);
+    }
+  }
+  blockedIpRegistry.set(ip, {
+    blockedUntil: now + durationMs,
+  });
+}
+
+function checkRateLimit(
+  ip: string,
+  now: number,
+  limitPerMinute = configuredRateLimitPerMinute
+): { allowed: boolean; retryAfterSeconds: number; limit: number } {
+  if (ip === "Unknown" || limitPerMinute <= 0) {
+    return { allowed: true, retryAfterSeconds: 0, limit: limitPerMinute };
+  }
+  let timestamps = rateLimitRegistry.get(ip);
+  if (timestamps) {
+    rateLimitRegistry.delete(ip);
+  } else {
+    if (rateLimitRegistry.size >= MAX_TRACKED_IPS) {
+      const oldestKey = rateLimitRegistry.keys().next().value;
+      if (oldestKey !== undefined) {
+        rateLimitRegistry.delete(oldestKey);
+      }
+    }
+    timestamps = [];
+  }
+
+  const oneMinuteAgo = now - 60000;
+  const recentTimestamps = timestamps.filter((ts) => ts > oneMinuteAgo);
+
+  if (recentTimestamps.length >= limitPerMinute) {
+    rateLimitRegistry.set(ip, recentTimestamps);
+    const oldest = recentTimestamps[0];
+    const retryAfterSeconds = Math.max(1, Math.ceil((oldest + 60000 - now) / 1000));
+    return { allowed: false, retryAfterSeconds, limit: limitPerMinute };
+  }
+
+  recentTimestamps.push(now);
+  rateLimitRegistry.set(ip, recentTimestamps);
+  return { allowed: true, retryAfterSeconds: 0, limit: limitPerMinute };
 }
 
 function previewText(value: string, maxLength = 160) {
@@ -1383,24 +1628,48 @@ async function getAnswerFromUpstream(input: AnswerRequestInput, requestId: strin
   };
 }
 
-async function handleClientRequest(req: Request): Promise<Response> {
+async function handleClientRequest(req: Request, server?: ServerLike): Promise<Response> {
   const url = new URL(req.url);
   const requestId = crypto.randomUUID();
-  const clientIp = getClientIp(req);
-
-  log("INFO", "request_received", {
-    requestId,
-    method: req.method,
-    path: url.pathname,
-    clientIp,
-    userAgent: previewText(req.headers.get("User-Agent") || "Unknown", 120),
-  });
+  const clientIp = getClientIp(req, server);
+  const now = Date.now();
 
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 200,
       headers: getCorsHeaders(),
     });
+  }
+
+  if (isIpBlocked(clientIp, now)) {
+    const record = blockedIpRegistry.get(clientIp);
+    const lastLog = record?.lastBlockedLogAt || 0;
+    if (now - lastLog > 10000) {
+      if (record) {
+        record.lastBlockedLogAt = now;
+      }
+      log("WARN", "blocked_ip_rejected", {
+        requestId,
+        clientIp,
+        path: url.pathname,
+      });
+    }
+    return jsonResponse({ error: "Access denied" }, 403);
+  }
+
+  if (isSuspiciousScannerPath(url.pathname)) {
+    blockIp(clientIp, now);
+    if (clientIp !== "Unknown" || now - lastUnknownScannerLogAt > 10000) {
+      if (clientIp === "Unknown") {
+        lastUnknownScannerLogAt = now;
+      }
+      log("WARN", "scanner_path_blocked", {
+        requestId,
+        clientIp,
+        path: url.pathname,
+      });
+    }
+    return jsonResponse({ error: "Access denied" }, 403);
   }
 
   if (
@@ -1424,16 +1693,46 @@ async function handleClientRequest(req: Request): Promise<Response> {
     });
   }
 
-  if (url.pathname !== "/answer" || req.method !== "POST") {
-    return jsonResponse(
-      {
-        message: "API path not found",
-        availablePaths: ["/", "/answer"],
-        method: req.method,
-        path: url.pathname,
+  log("INFO", "request_received", {
+    requestId,
+    method: req.method,
+    path: url.pathname,
+    clientIp,
+    userAgent: previewText(req.headers.get("User-Agent") || "Unknown", 120),
+  });
+
+  const rateLimitResult = checkRateLimit(clientIp, now);
+  if (!rateLimitResult.allowed) {
+    log("WARN", "rate_limit_exceeded", {
+      requestId,
+      clientIp,
+      limit: rateLimitResult.limit,
+    });
+    return new Response(JSON.stringify({ error: "Too Many Requests" }), {
+      status: 429,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(rateLimitResult.retryAfterSeconds),
+        ...getCorsHeaders(),
       },
-      404
-    );
+    });
+  }
+
+  if (url.pathname !== "/answer" || req.method !== "POST") {
+    return jsonResponse({ error: "Not Found" }, 404);
+  }
+
+  if (configuredClientApiKey) {
+    const providedToken = extractAuthToken(req);
+    if (!verifyClientToken(providedToken, configuredClientApiKey)) {
+      log("WARN", "client_auth_failed", {
+        requestId,
+        hasAuthHeader: Boolean(req.headers.get("authorization")),
+        hasApiKeyHeader: Boolean(req.headers.get("x-api-key")),
+        clientIp,
+      });
+      return jsonResponse({ error: "未提供有效鉴权 Token" }, 401);
+    }
   }
 
   const declaredLength = Number(req.headers.get("content-length") || "0");
@@ -1583,9 +1882,32 @@ if (import.meta.main) {
     hostname: "0.0.0.0",
     port: PORT,
     maxRequestBodySize: SERVER_HARD_REQUEST_BODY_LIMIT_BYTES,
-    fetch: handleClientRequest,
+    fetch(req, server) {
+      return handleClientRequest(req, server);
+    },
   });
 }
+
+const __testing = {
+  setClientApiKey: setConfiguredClientApiKey,
+  setTrustProxy: setConfiguredTrustProxy,
+  setRateLimitPerMinute: setConfiguredRateLimitPerMinute,
+  getRateLimitPerMinute: () => configuredRateLimitPerMinute,
+  resetSecurityState: () => {
+    rateLimitRegistry.clear();
+    blockedIpRegistry.clear();
+    lastUnknownScannerLogAt = 0;
+  },
+  getTrackedIpsCount: () => rateLimitRegistry.size,
+  getBlockedIpsCount: () => blockedIpRegistry.size,
+  isIpBlocked,
+  blockIp,
+  checkRateLimit,
+  isSuspiciousScannerPath,
+  getClientIp,
+  normalizeIpAddress,
+  parseIntInRange,
+};
 
 export {
   SERVICE_VERSION,
@@ -1611,5 +1933,8 @@ export {
   shouldRetryWithFallbackMode,
   isImageUnsupportedError,
   getAnswerFromUpstream,
+  extractAuthToken,
+  verifyClientToken,
+  __testing,
 };
 

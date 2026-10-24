@@ -15,6 +15,7 @@ See [AGENT_README.md](./AGENT_README.md) for operational context.
 - Automatic multimodal image processing: handles direct Base64 uploads and downloads question/option images with SSRF guards and anti-leech headers for vision models.
 - Response repair for common malformed outputs such as fenced JSON and trailing prose.
 - Graceful degradation to `"不知道"` instead of surfacing opaque upstream formatting failures to OCS.
+- Built-in anti-scanner and defense engine: automatically detects suspicious paths (e.g. `/.env`, `/.git`, script extensions) and jails offending IPs; in-memory sliding-window rate limiting (default 60 req/min); generic 404 responses that conceal internal endpoint routes.
 - Dockerfile and Docker Compose deployment support.
 
 ## Quickstart
@@ -27,6 +28,7 @@ See [AGENT_README.md](./AGENT_README.md) for operational context.
    - `OPENAI_API_KEY`
    - `OPENAI_BASE_URL` if you use a proxy or gateway
    - `OPENAI_MODEL`
+   - `CLIENT_API_KEY` (optional), if you want to prevent unauthorized usage in public deployments
 
 ### Run locally
 
@@ -118,10 +120,19 @@ If you are using OCS 5.x+ and prefer concise template strings without JavaScript
 
 - **OCS 5.x Health Check**: OCS 5.x sends `HEAD /answer?t=<timestamp>` to probe server connectivity. The service returns HTTP 200, making the card display "Connected".
 - **Yellow Banner Elimination**: Once the configuration includes `${suggestion_title}` or `${images}`, the OCS 5.x warning banner stating that the question bank does not support image optimization will disappear.
+- **Client Authentication (Optional)**: If `CLIENT_API_KEY` is set on the server, answer requests require authorization. Add `"Authorization": "Bearer <YOUR_CLIENT_API_KEY>"` to the `headers` field of your OCS question bank configuration. If `CLIENT_API_KEY` is unset, the service allows public access. Health-check probes (`HEAD`/`GET`) are always unauthenticated.
 - If `SYSTEM_PROMPT` is not provided, the service uses a built-in default prompt that enforces OCS-friendly single-choice, multiple-choice, and judgement answer formatting.
 - The service does not send `max_tokens`, `temperature`, or similar sampling controls.
 - Set `DEBUG_REQUEST_DETAILS=true` to log incoming request keys plus summarized `question`, `options`, and `type` values when checking what OCS actually sent.
 - `POST /answer` accepts optional `options`, `type`, `images`, and `suggestion_title` fields and injects them into the upstream prompt.
+- **Security and Anti-Abuse Controls (Optional)**:
+  - `RATE_LIMIT_PER_MINUTE` (default: `60`, range: `0-10000`): Throttles rapid POST requests per IP (set to `0` to disable rate limiting). Health probes (`GET`/`HEAD`) are exempt to avoid false positives.
+  - `IP_BLOCK_DURATION_MS` (default: `3600000` = 1 hour, range: `1000-2592000000`): Duration in milliseconds to automatically jail offending IPs hitting honeypot scanner paths (e.g., `/.env`, `/.git`, webshell paths). Jailed IPs are stored in a dedicated memory registry isolated from rate-limit eviction.
+  - `TRUST_PROXY` (default: `false`): Enable when running behind a single trusted reverse proxy (e.g. Nginx). When enabled, respects `X-Forwarded-For` (rightmost hop) and `X-Real-IP`, strictly normalizing IPv4-mapped and canonical IPv6 addresses. **Deployment Note**: Direct public access to port 3000 must be forbidden (e.g. bind `"127.0.0.1:3000:3000"` in `compose.yaml` or restrict via firewall), ensuring only the trusted proxy can connect. Recommended Nginx proxy headers:
+    ```nginx
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+    ```
 - Recoverable upstream failures degrade to a valid answer payload with `"不知道"`.
 
 ## Help
