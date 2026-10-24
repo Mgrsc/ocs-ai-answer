@@ -11,8 +11,9 @@ See [AGENT_README.md](./AGENT_README.md) for operational context.
 - JSON-first upstream requests with automatic fallback when `response_format` is unsupported.
 - Stable output contract: `{"question":"...","answer":"..."}`.
 - Optional `options` and `type` request fields can be forwarded from OCS to improve single-choice, multiple-choice, and judgement accuracy.
+- Automatic multimodal image processing: safely extracts question/option images with SSRF guards and anti-leech headers, converting them to Base64 data URLs for vision models.
 - Response repair for common malformed outputs such as fenced JSON and trailing prose.
-- Graceful degradation to `"无法找到答案"` instead of surfacing opaque upstream formatting failures to OCS.
+- Graceful degradation to `"不知道"` instead of surfacing opaque upstream formatting failures to OCS.
 - Dockerfile and Docker Compose deployment support.
 
 ## Quickstart
@@ -48,7 +49,7 @@ Expected shape:
 ```json
 {
   "question": "下列关于家庭表述中，不正确的是（）。",
-  "answer": "无法找到答案"
+  "answer": "不知道"
 }
 ```
 
@@ -84,7 +85,7 @@ Replace the host in `homepage` and `url` with your deployment address:
 - The service does not send `max_tokens`, `temperature`, or similar sampling controls.
 - Set `DEBUG_REQUEST_DETAILS=true` to log incoming request keys plus summarized `question`, `options`, and `type` values when checking what OCS actually sent.
 - `POST /answer` accepts optional `options` and `type` fields and injects them into the upstream prompt.
-- Recoverable upstream failures degrade to a valid answer payload with `"无法找到答案"`.
+- Recoverable upstream failures degrade to a valid answer payload with `"不知道"`.
 
 ## Help
 

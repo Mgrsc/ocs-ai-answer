@@ -9,8 +9,8 @@
 ## Runtime Flow
 
 1. Validate request JSON and extract `question`, optional `options`, and optional `type`.
-2. Build the upstream user prompt from question context, including options and type when present, then send the request in `json` mode with `response_format: { type: "json_object" }`.
-3. If the provider rejects JSON mode or returns unusable content, retry once in `fallback` mode without `response_format`.
+2. Extract image URLs from `question` and `options`, fetch images with anti-leech headers (such as Chaoxing referer), convert them to Base64 Data URLs, and build the upstream user message (plain string when no images, or multimodal `image_url` parts when images exist). Then send the request in `json` mode with `response_format: { type: "json_object" }`.
+3. If the provider rejects JSON mode, rejects multimodal images, or returns unusable content, retry once in `fallback` mode without `response_format` (and without images if rejected).
 4. Extract content from compatible shapes:
    - `choices[0].message.content` string
    - `choices[0].message.content` part array
@@ -21,7 +21,7 @@
   - isolate the first complete JSON object
 6. Validate the parsed payload and enforce:
    - `question` must be a string, otherwise reuse the incoming question
-   - `answer` must be a non-empty string, otherwise use `"无法找到答案"`
+   - `answer` must be a non-empty string, otherwise use `NO_ANSWER` (`"不知道"`)
 7. On recoverable upstream failures, return the fallback payload with HTTP 200.
 
 ## Public Interface
@@ -44,6 +44,7 @@
 - Client errors:
   - invalid JSON body -> `400`
   - missing or empty `question` -> `400`
+  - request body exceeds 1MB -> `413` with JSON `{ "error": "请求体过大" }` and CORS headers (runtime hard limit 4MB)
 
 ## Environment Variables
 
@@ -62,6 +63,10 @@
 - `SYSTEM_PROMPT`
   - optional
   - when unset, the service uses a built-in default prompt with OCS-oriented rules for single, multiple, and judgement questions
+- `NO_ANSWER`
+  - optional
+  - default: `不知道`
+  - custom fallback text returned in `answer` when the answer cannot be determined
 - `DEBUG_REQUEST_DETAILS`
   - optional
   - default: `false`
@@ -69,6 +74,10 @@
 - `PORT`
   - optional
   - default: `3000`
+- `ALLOWED_IMAGE_HOSTS`
+  - optional
+  - default: unset (allows any public host protected by default SSRF IP defenses)
+  - optional comma-separated host patterns (e.g. `*.chaoxing.com,*.ananas.chaoxing.com`) to restrict outgoing image downloads
 
 ## Startup And Deployment
 
@@ -88,14 +97,19 @@
 - Every request gets a `requestId`.
 - Key events:
   - `request_received`
+  - `request_body_too_large`
   - `answer_request_validated`
+  - `image_count_exceeded`
+  - `image_processing_started`
+  - `image_processing_completed`
+  - `image_download_failed`
   - `upstream_request_started`
   - `upstream_response_received`
   - `upstream_content_extracted`
   - `upstream_attempt_failed`
   - `answer_response_ready`
 - Repair visibility:
-  - `repairFlags` may include `bomRemoved`, `codeFenceStripped`, `smartQuotesNormalized`, `outerJsonExtracted`
+  - `repairFlags` may include `bomRemoved`, `codeFenceStripped`, `outerJsonExtracted`
 - Request debug visibility:
   - `answer_request_validated` always logs `receivedKeys`
   - when `DEBUG_REQUEST_DETAILS=true`, it also logs `requestBodyPreview`
@@ -103,9 +117,10 @@
 
 ## Failure Model
 
-- Upstream formatting failure: degrade to `{ question, answer: "无法找到答案" }`
-- Upstream transport failure: degrade to `{ question, answer: "无法找到答案" }`
+- Upstream formatting failure: degrade to `{ question, answer: NO_ANSWER }`
+- Upstream transport failure: degrade to `{ question, answer: NO_ANSWER }`
 - Invalid client request: return `400`
+- Image download security: private and loopback IPs are blocked prior to outbound connection. Note that DNS rebinding (TOCTOU between pre-check lookup and fetch) is a recognized platform limitation in high-level fetch runtimes without socket pinning.
 
 ## Troubleshooting
 
@@ -118,18 +133,19 @@
   - inspect `rawPreview`, `finishReason`, and `repairFlags`
   - common causes are truncated completions, fenced JSON, or extra prose
 - Empty or missing answer values:
-  - this is normalized to `"无法找到答案"` by design
+  - this is normalized to `NO_ANSWER` (`"不知道"`) by design
 
 ## Test Strategy
 
-- Primary validation is request/response behavior over HTTP.
-- Cover these cases when adding or changing parsing logic:
-  - valid JSON object
-  - fenced JSON object
-  - JSON followed by explanatory text
-  - provider rejects `response_format`
-  - provider returns content parts instead of a single string
-  - provider returns missing or empty `answer`
+- Automated tests run via `bun test` and type checks via `bun run typecheck`.
+- Test suite in `index.test.ts` covers:
+  - valid and malformed JSON repair
+  - SSRF private IP, loopback, link-local, cloud metadata, and IPv6 mapped addresses blocking
+  - manual redirect hops and security checks
+  - stream size limits and client request body limits (413)
+  - retry without images on 413 or multimodal rejection
+  - question text fidelity preserving original request text
+  - OpenAI multimodal message construction
 
 ## File Responsibility
 
@@ -150,10 +166,4 @@
 
 ## Validation Notes
 
-- No code was executed during this task.
-- If validation is needed later, prefer manual HTTP cases that cover:
-  - valid JSON upstream output
-  - fenced JSON
-  - JSON plus trailing prose
-  - unsupported `response_format`
-  - missing `answer`
+- Validated via `bun test` (32 tests: 31 offline unit/integration passing in ~70ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).

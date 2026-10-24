@@ -11,8 +11,9 @@
 - 默认优先使用 JSON 模式请求上游；若 `response_format` 不被支持，会自动回退。
 - 固定输出结构：`{"question":"...","answer":"..."}`。
 - 支持接收 OCS 传来的可选 `options` 和 `type` 字段，提升单选、多选、判断题的命中率。
+- 自动化多模态图片处理：自动从题干与选项提取图片，结合防盗链头与出站 SSRF 防御，安全转换为 Base64 Data URL 并交付给多模态视觉模型。
 - 自动修复常见异常输出，例如 Markdown 代码块包裹的 JSON、尾随解释文本等。
-- 对可恢复的上游异常统一降级为 `"无法找到答案"`，避免 OCS 误判为题库连接失败。
+- 对可恢复的上游异常统一降级为 `"不知道"`，避免 OCS 误判为题库连接失败。
 - 支持 Dockerfile 与 Docker Compose 部署。
 
 ## 快速开始
@@ -48,7 +49,7 @@ curl -X POST http://localhost:3000/answer \
 ```json
 {
   "question": "下列关于家庭表述中，不正确的是（）。",
-  "answer": "无法找到答案"
+  "answer": "不知道"
 }
 ```
 
@@ -84,7 +85,7 @@ docker compose up -d
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
 - 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。
 - `POST /answer` 额外支持可选的 `options`、`type` 字段，并会一并传给上游模型。
-- 对可恢复的上游错误，服务会降级返回合法 JSON，`answer` 固定为 `"无法找到答案"`。
+- 对可恢复的上游错误，服务会降级返回合法 JSON，`answer` 固定为 `"不知道"`。
 
 ## 帮助
 
