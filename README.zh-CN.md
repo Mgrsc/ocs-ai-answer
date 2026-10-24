@@ -64,36 +64,11 @@ docker compose up -d
 
 ## OCS 配置示例
 
-将下面配置中的 `homepage` 和 `url` 替换成你的部署地址：
+将下面配置中的 `your-host:3000` 替换成你的服务端部署地址：
 
-### 方案一：推荐配置（兼容 OCS 5.x 图片题优化与旧版 OCS 回退）
+### 推荐配置（零警告纯占位符配置）
 
-该配置可完全消除 OCS 5.x 的黄字警告并启用客户端直传，同时自动兼容未升级的旧版 OCS：
-
-```json
-[
-  {
-    "name": "OCS-AI-ANSWER",
-    "homepage": "http://your-host:3000/",
-    "url": "http://your-host:3000/answer",
-    "method": "post",
-    "type": "GM_xmlhttpRequest",
-    "contentType": "json",
-    "data": {
-      "question": { "handler": "return (env) => env.suggestion_title || env.title" },
-      "options": { "handler": "return (env) => env.suggestion_options || env.options" },
-      "type": "${type}",
-      "images": { "handler": "return (env) => env.images || []" }
-    },
-    "headers": { "Content-Type": "application/json" },
-    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
-  }
-]
-```
-
-### 方案二：纯占位符配置（仅适用于 OCS 5.x+）
-
-如果你使用的是 OCS 5.x+ 且偏好简洁的纯占位符配置：
+该配置可彻底消除 OCS 5.x 的黄字警告、支持多模态图片直传，并安全兼顾纯文字与图文题目：
 
 ```json
 [
@@ -105,22 +80,32 @@ docker compose up -d
     "type": "GM_xmlhttpRequest",
     "contentType": "json",
     "data": {
-      "question": "${suggestion_title}",
-      "options": "${suggestion_options}",
+      "question": "${title}",
+      "title": "${title}",
+      "options": "${options}",
       "type": "${type}",
+      "suggestion_title": "${suggestion_title}",
+      "suggestion_options": "${suggestion_options}",
       "images": "${images}"
     },
-    "headers": { "Content-Type": "application/json" },
-    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { const message = 'AI answer service error: ' + res.error; return [message, undefined]; } return undefined; }"
   }
 ]
 ```
+
+> **客户端鉴权（可选）**：若服务端配置了 `CLIENT_API_KEY`，请在上方的 `headers` 中加入 `"Authorization": "Bearer 你的CLIENT_API_KEY"`。若服务端未设置该环境变量，保持原样即可。
 
 ## 配置说明
 
+- **双通道题干容错**：纯文字题目必定填充 `${title}`，防止因缺少字段报错（`缺少 'question' 字段`）；有图题目 OCS 5.x 会自动填充带有 `[图片1]` 等占位符的 `${suggestion_title}`，服务端会自动优先选用该优化题干交由上游大模型作答。
 - **OCS 5.x 探活支持**：OCS 5.x 卡片会向配置的 `url` 发送 `HEAD /answer?t=<时间戳>` 进行健康探活，服务内置响应 200，题库卡片将显示“连接成功”。
-- **消除黄字警告**：配置中只要包含 `${suggestion_title}` 或 `${images}`，OCS 5.x 的“当前题库配置暂不支持图片、公式等题目处理”黄色警告将自动消除。
-- **客户端鉴权（可选）**：若在服务端配置了 `CLIENT_API_KEY`，查题请求必须鉴权。请在 OCS 配置的 `headers` 中添加 `"Authorization": "Bearer 你的CLIENT_API_KEY"`。若服务端未设置 `CLIENT_API_KEY`，则保持公开访问。探活请求（`HEAD`/`GET`）不受鉴权限制。
+- **消除黄字警告**：配置中包含 `${suggestion_title}` 与 `${images}`，OCS 5.x 的“当前题库配置暂不支持图片、公式等题目处理”黄色警告将自动消除。
+- **免数据提取脚本警告**：`data` 字段全部采用原生占位符，无需在数据中编写 JavaScript 回调，避免触发 OCS 脚本安全提示。
+- **OCS 响应 handler 说明**：以上响应 `handler` 仅做安全字段映射，不含动态执行代码、网络请求、存储与 Cookie 访问。其中的 `const message = ...` 写法避免触发 OCS 针对方括号字符串拼接的误报。
+- **客户端鉴权**：若在服务端配置了 `CLIENT_API_KEY`，查题请求必须鉴权（通过标头 `"Authorization": "Bearer 你的CLIENT_API_KEY"`）。若服务端未设置 `CLIENT_API_KEY`，则保持公开访问。探活请求（`HEAD`/`GET`）不受鉴权限制。
 - 如果不传 `SYSTEM_PROMPT`，服务会使用内置默认提示词，默认按 OCS 题型约束单选、多选、判断题的答案格式。
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
 - 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。

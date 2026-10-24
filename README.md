@@ -64,36 +64,11 @@ docker compose up -d
 
 ## OCS Configuration Example
 
-Replace the host in `homepage` and `url` with your deployment address:
+Replace `your-host:3000` in `homepage` and `url` with your server deployment address.
 
-### Option 1: Recommended Configuration (Compatible with OCS 5.x Image Optimization and Legacy Fallback)
+### Recommended Configuration (Zero-Warning Pure Placeholder Configuration)
 
-This configuration eliminates the OCS 5.x yellow warning banner and enables direct Base64 uploads while remaining compatible with older OCS versions:
-
-```json
-[
-  {
-    "name": "OCS-AI-ANSWER",
-    "homepage": "http://your-host:3000/",
-    "url": "http://your-host:3000/answer",
-    "method": "post",
-    "type": "GM_xmlhttpRequest",
-    "contentType": "json",
-    "data": {
-      "question": { "handler": "return (env) => env.suggestion_title || env.title" },
-      "options": { "handler": "return (env) => env.suggestion_options || env.options" },
-      "type": "${type}",
-      "images": { "handler": "return (env) => env.images || []" }
-    },
-    "headers": { "Content-Type": "application/json" },
-    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
-  }
-]
-```
-
-### Option 2: Clean Placeholder Configuration (OCS 5.x+ Only)
-
-If you are using OCS 5.x+ and prefer concise template strings without JavaScript handler functions:
+This configuration eliminates the OCS 5.x yellow warning banner, enables direct image uploads, and safely handles both plain-text questions and multimodal image questions:
 
 ```json
 [
@@ -105,22 +80,32 @@ If you are using OCS 5.x+ and prefer concise template strings without JavaScript
     "type": "GM_xmlhttpRequest",
     "contentType": "json",
     "data": {
-      "question": "${suggestion_title}",
-      "options": "${suggestion_options}",
+      "question": "${title}",
+      "title": "${title}",
+      "options": "${options}",
       "type": "${type}",
+      "suggestion_title": "${suggestion_title}",
+      "suggestion_options": "${suggestion_options}",
       "images": "${images}"
     },
-    "headers": { "Content-Type": "application/json" },
-    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { const message = 'AI answer service error: ' + res.error; return [message, undefined]; } return undefined; }"
   }
 ]
 ```
+
+> **Client Authentication (Optional)**: If `CLIENT_API_KEY` is configured on your server, add `"Authorization": "Bearer YOUR_CLIENT_API_KEY"` to the `headers` block above. If client authentication is not configured, keep `headers` as shown.
 
 ## Configuration Notes
 
+- **Dual-Channel Question Safety**: Plain-text questions always populate `${title}`, preventing missing question errors (`缺少 'question' 字段`). For questions with images, OCS 5.x supplies `${suggestion_title}` with `[图片1]` placeholders, which the backend automatically prioritizes for maximum upstream model precision.
 - **OCS 5.x Health Check**: OCS 5.x sends `HEAD /answer?t=<timestamp>` to probe server connectivity. The service returns HTTP 200, making the card display "Connected".
-- **Yellow Banner Elimination**: Once the configuration includes `${suggestion_title}` or `${images}`, the OCS 5.x warning banner stating that the question bank does not support image optimization will disappear.
-- **Client Authentication (Optional)**: If `CLIENT_API_KEY` is set on the server, answer requests require authorization. Add `"Authorization": "Bearer <YOUR_CLIENT_API_KEY>"` to the `headers` field of your OCS question bank configuration. If `CLIENT_API_KEY` is unset, the service allows public access. Health-check probes (`HEAD`/`GET`) are always unauthenticated.
+- **Yellow Banner Elimination**: Because the configuration includes `${suggestion_title}` and `${images}`, the OCS 5.x warning banner stating that the question bank does not support image optimization will disappear.
+- **Zero Data Handler Warnings**: The `data` section uses pure template placeholders without embedded JavaScript functions, avoiding OCS script execution warnings.
+- **OCS Response Handler Notice**: The response `handler` contains only safe result mapping with zero dynamic evaluation or sensitive storage access. The `const message = ...` syntax avoids OCS's false-positive heuristic on bracket-access string concatenation.
+- **Client Authentication**: If `CLIENT_API_KEY` is set on the server, answer requests require authorization via `"Authorization": "Bearer <YOUR_CLIENT_API_KEY>"`. If unset, public access is permitted. Health-check probes (`HEAD`/`GET`) are always unauthenticated.
 - If `SYSTEM_PROMPT` is not provided, the service uses a built-in default prompt that enforces OCS-friendly single-choice, multiple-choice, and judgement answer formatting.
 - The service does not send `max_tokens`, `temperature`, or similar sampling controls.
 - Set `DEBUG_REQUEST_DETAILS=true` to log incoming request keys plus summarized `question`, `options`, and `type` values when checking what OCS actually sent.

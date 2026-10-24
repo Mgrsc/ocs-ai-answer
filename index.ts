@@ -571,7 +571,34 @@ function collectImageUrlsFromInput(input: AnswerRequestInput): string[] {
 }
 
 function normalizeDirectImages(rawImages: unknown): NormalizedDirectImagesResult {
-  if (!Array.isArray(rawImages)) {
+  let candidateList: unknown[] = [];
+  let malformedCount = 0;
+
+  if (Array.isArray(rawImages)) {
+    candidateList = rawImages;
+  } else if (typeof rawImages === "string") {
+    const trimmed = rawImages.trim();
+    if (trimmed.length > 0) {
+      if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            candidateList = parsed;
+          } else {
+            malformedCount = 1;
+          }
+        } catch {
+          malformedCount = 1;
+        }
+      } else if (trimmed.startsWith("data:image/") && trimmed.includes(";base64,")) {
+        candidateList = [trimmed];
+      } else {
+        malformedCount = 1;
+      }
+    }
+  }
+
+  if (candidateList.length === 0 && malformedCount === 0) {
     return {
       valid: [],
       receivedCount: 0,
@@ -584,13 +611,13 @@ function normalizeDirectImages(rawImages: unknown): NormalizedDirectImagesResult
   }
 
   const valid: string[] = [];
-  let invalidCount = 0;
+  let invalidCount = malformedCount;
   let countExceededCount = 0;
   let singleSizeExceededCount = 0;
   let budgetExceededCount = 0;
   let totalBytes = 0;
 
-  for (const item of rawImages) {
+  for (const item of candidateList) {
     if (typeof item !== "string") {
       invalidCount += 1;
       continue;
@@ -624,7 +651,7 @@ function normalizeDirectImages(rawImages: unknown): NormalizedDirectImagesResult
 
   return {
     valid,
-    receivedCount: rawImages.length,
+    receivedCount: candidateList.length + malformedCount,
     invalidCount,
     countExceededCount,
     singleSizeExceededCount,
@@ -1815,8 +1842,16 @@ async function handleClientRequest(req: Request, server?: ServerLike): Promise<R
       ? suggestionTitleValue.trim()
       : undefined;
 
+  const rawQuestion =
+    typeof body?.question === "string" ? body.question.trim() : "";
+  const rawTitle =
+    typeof body?.title === "string" ? body.title.trim() : "";
   const question =
-    typeof body?.question === "string" ? (body.question as string).trim() : "";
+    rawQuestion.length > 0
+      ? rawQuestion
+      : rawTitle.length > 0
+      ? rawTitle
+      : suggestionTitle || "";
 
   if (!question) {
     log("WARN", "request_question_missing", {
@@ -1825,6 +1860,7 @@ async function handleClientRequest(req: Request, server?: ServerLike): Promise<R
       requestSummary: DEBUG_REQUEST_DETAILS
         ? {
             question: summarizeValue(body?.question),
+            title: summarizeValue(body?.title),
             options: summarizeValue(optionsValue),
             type: summarizeValue(typeValue),
             bodyPreview: previewText(requestBody, 400),

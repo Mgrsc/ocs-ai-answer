@@ -595,6 +595,89 @@ describe("OCS 5.x Image Optimization and v2 Contract", () => {
     expect(result.countExceededCount).toBe(1);
   });
 
+  it("should normalize stringified direct images and tolerate invalid or empty string", () => {
+    const jsonArrayString = JSON.stringify([
+      "data:image/png;base64,iVBORw0KGgoAAA==",
+      "http://invalid.url/pic.png",
+    ]);
+    const parsedResult = normalizeDirectImages(jsonArrayString);
+    expect(parsedResult.valid).toHaveLength(1);
+    expect(parsedResult.invalidCount).toBe(1);
+
+    const singleDataUrl = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    const singleResult = normalizeDirectImages(singleDataUrl);
+    expect(singleResult.valid).toHaveLength(1);
+    expect(singleResult.invalidCount).toBe(0);
+
+    const emptyStringResult = normalizeDirectImages("");
+    expect(emptyStringResult.valid).toHaveLength(0);
+    expect(emptyStringResult.invalidCount).toBe(0);
+
+    const invalidStringResult = normalizeDirectImages("not-json-and-not-data-url");
+    expect(invalidStringResult.valid).toHaveLength(0);
+    expect(invalidStringResult.invalidCount).toBe(1);
+  });
+
+  it("should fallback to title or suggestion_title when question is missing or empty", async () => {
+    const originalFetch = globalThis.fetch;
+    (globalThis as any).fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "echoed", answer: "Fallback Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+
+    try {
+      const reqWithTitleOnly = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Question via title field",
+          options: ["A", "B"],
+        }),
+      });
+      const res1 = await handleClientRequest(reqWithTitleOnly);
+      expect(res1.status).toBe(200);
+      const json1 = await res1.json();
+      expect(json1.question).toBe("Question via title field");
+      expect(json1.answer).toBe("Fallback Answer");
+
+      const reqWithEmptyQuestionAndTitle = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: "",
+          title: "Question from title when question is empty",
+        }),
+      });
+      const res2 = await handleClientRequest(reqWithEmptyQuestionAndTitle);
+      expect(res2.status).toBe(200);
+      const json2 = await res2.json();
+      expect(json2.question).toBe("Question from title when question is empty");
+
+      const reqWithSuggestionTitleOnly = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          suggestion_title: "Question purely from suggestion_title",
+        }),
+      });
+      const res3 = await handleClientRequest(reqWithSuggestionTitleOnly);
+      expect(res3.status).toBe(200);
+      const json3 = await res3.json();
+      expect(json3.question).toBe("Question purely from suggestion_title");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("should explain image placeholder order in prompt only when placeholders and images are present", () => {
     const input = {
       question: "What is in [图片1] and [图片2]?",

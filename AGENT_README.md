@@ -203,4 +203,4 @@
 
 ## Validation Notes
 
-- Validated via `bun test` (63 tests: 62 offline unit/integration passing in ~210ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).
+- Validated via `bun test` (65 tests: 64 offline unit/integration passing in ~215ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).
