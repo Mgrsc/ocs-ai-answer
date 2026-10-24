@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.*
+*.env
+node_modules
+.dev
+dev-file
+*.log
+*.test.ts
+.codex

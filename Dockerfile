@@ -8,7 +8,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN bun install --production
+RUN bun install --production --frozen-lockfile
 
 EXPOSE 3000
 

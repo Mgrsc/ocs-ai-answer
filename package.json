@@ -1,5 +1,6 @@
 {
   "name": "bun-openai-server",
+  "version": "1.2.0",
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
@@ -13,7 +14,9 @@
   },
   "scripts": {
     "start": "bun run index.ts",
-    "dev": "bun --watch run index.ts"
+    "dev": "bun --watch run index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   }
 }
 
