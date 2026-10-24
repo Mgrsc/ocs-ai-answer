@@ -26,16 +26,23 @@
 
 ## Public Interface
 
-### `GET /`
+### `GET /` and `HEAD /` (and `GET /answer`, `HEAD /answer`)
 
-- Health/status endpoint.
-- Returns JSON with version, status, endpoint list, and active model.
+- Health/status & OCS 5.x connection probing endpoints.
+- Returns status 200 with JSON (version, status, endpoint list, active model) and CORS headers.
 
 ### `POST /answer`
 
 - Request body:
   ```json
-  { "question": "...", "options": ["..."], "type": "single" }
+  {
+    "question": "...",
+    "options": ["..."],
+    "type": "single",
+    "images": ["data:image/...;base64,..."],
+    "suggestion_title": "...",
+    "suggestion_options": ["..."]
+  }
   ```
 - Success body:
   ```json
@@ -44,7 +51,12 @@
 - Client errors:
   - invalid JSON body -> `400`
   - missing or empty `question` -> `400`
-  - request body exceeds 1MB -> `413` with JSON `{ "error": "请求体过大" }` and CORS headers (runtime hard limit 4MB)
+  - request body exceeds 16MB -> `413` with JSON `{ "error": "请求体过大" }` and CORS headers (runtime hard limit 32MB)
+- Image upload limits (both direct Base64 and downloaded):
+  - maximum 4 images per request
+  - maximum 4MB per single image
+  - maximum 8MB total image payload
+  - images exceeding limits are skipped and detailed in logs
 
 ## Environment Variables
 
@@ -99,6 +111,7 @@
   - `request_received`
   - `request_body_too_large`
   - `answer_request_validated`
+  - `direct_images_processed`
   - `image_count_exceeded`
   - `image_processing_started`
   - `image_processing_completed`
@@ -166,4 +179,4 @@
 
 ## Validation Notes
 
-- Validated via `bun test` (32 tests: 31 offline unit/integration passing in ~70ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).
+- Validated via `bun test` (43 tests: 42 offline unit/integration passing in ~140ms + 1 network test gated by `RUN_NETWORK_TESTS=1`) and `bun run typecheck` (`tsc --noEmit`, 0 errors).

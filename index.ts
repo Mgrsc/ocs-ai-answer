@@ -17,8 +17,8 @@ const PORT = Number(process.env.PORT || 3000);
 const DEBUG_REQUEST_DETAILS =
   process.env.DEBUG_REQUEST_DETAILS === "1" ||
   process.env.DEBUG_REQUEST_DETAILS === "true";
-const MAX_CLIENT_REQUEST_BODY_BYTES = 1024 * 1024;
-const SERVER_HARD_REQUEST_BODY_LIMIT_BYTES = MAX_CLIENT_REQUEST_BODY_BYTES * 4;
+const MAX_CLIENT_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+const SERVER_HARD_REQUEST_BODY_LIMIT_BYTES = MAX_CLIENT_REQUEST_BODY_BYTES * 2;
 const UPSTREAM_TIMEOUT_MS = 60000;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 10000;
 const MAX_IMAGES_PER_REQUEST = 4;
@@ -29,7 +29,7 @@ const CHAOXING_REFERER = "https://mooc1.chaoxing.com/";
 const DEFAULT_IMAGE_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const IMAGE_URL_REGEX =
-  /https?:\/\/[^\s"'<>\)]+\.(?:png|jpg|jpeg|gif|webp|bmp|svg)(?:\?[^\s"'<>\)]*)?/gi;
+  /https?:\/\/[^\s"'<>()\[\]]+\.(?:png|jpg|jpeg|gif|webp|bmp|svg)(?:\?[^\s"'<>()\[\]]*)?/gi;
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const ALLOWED_PORTS = new Set([80, 443, 8080, 8443]);
 const ALLOWED_IMAGE_HOSTS_RAW = process.env.ALLOWED_IMAGE_HOSTS;
@@ -72,10 +72,24 @@ type RepairFlags = {
   outerJsonExtracted: boolean;
 };
 
+type NormalizedDirectImagesResult = {
+  valid: string[];
+  receivedCount: number;
+  invalidCount: number;
+  countExceededCount: number;
+  singleSizeExceededCount: number;
+  budgetExceededCount: number;
+  totalBytes: number;
+};
+
 type AnswerRequestInput = {
   question: string;
   options?: string[];
   type?: string;
+  suggestionTitle?: string;
+  suggestionOptions?: string[];
+  directImages?: string[];
+  directImagesMeta?: NormalizedDirectImagesResult;
 };
 
 type MessageContentPart =
@@ -227,15 +241,26 @@ function normalizeOptions(value: unknown) {
   return undefined;
 }
 
+function resolvePromptSources(input: AnswerRequestInput) {
+  const promptQuestion = input.suggestionTitle || input.question;
+  const promptOptions =
+    input.suggestionOptions && input.suggestionOptions.length > 0
+      ? input.suggestionOptions
+      : input.options;
+  return { promptQuestion, promptOptions };
+}
+
 function buildUpstreamQuestion(input: AnswerRequestInput) {
-  const parts = [`Question: ${input.question}`];
+  const { promptQuestion, promptOptions } = resolvePromptSources(input);
+
+  const parts = [`Question: ${promptQuestion}`];
 
   if (input.type) {
     parts.push(`Type: ${input.type}`);
   }
 
-  if (input.options && input.options.length > 0) {
-    parts.push(`Options:\n${input.options.join("\n")}`);
+  if (promptOptions && promptOptions.length > 0) {
+    parts.push(`Options:\n${promptOptions.join("\n")}`);
   }
 
   if (input.type === "multiple") {
@@ -278,20 +303,89 @@ function extractImageUrls(text: string): string[] {
   if (!matches) {
     return [];
   }
-  const cleaned = matches.map((item) => item.replace(/[;,.)"'<>]+$/, ""));
+  const cleaned = matches.map((item) => item.replace(/[;,.)"'<>\[\]]+$/, ""));
   return Array.from(new Set(cleaned));
 }
 
 function collectImageUrlsFromInput(input: AnswerRequestInput): string[] {
   const sources = [input.question];
+  if (input.suggestionTitle) {
+    sources.push(input.suggestionTitle);
+  }
   if (input.options && input.options.length > 0) {
     sources.push(...input.options);
+  }
+  if (input.suggestionOptions && input.suggestionOptions.length > 0) {
+    sources.push(...input.suggestionOptions);
   }
   const collected: string[] = [];
   for (const source of sources) {
     collected.push(...extractImageUrls(source));
   }
   return Array.from(new Set(collected));
+}
+
+function normalizeDirectImages(rawImages: unknown): NormalizedDirectImagesResult {
+  if (!Array.isArray(rawImages)) {
+    return {
+      valid: [],
+      receivedCount: 0,
+      invalidCount: 0,
+      countExceededCount: 0,
+      singleSizeExceededCount: 0,
+      budgetExceededCount: 0,
+      totalBytes: 0,
+    };
+  }
+
+  const valid: string[] = [];
+  let invalidCount = 0;
+  let countExceededCount = 0;
+  let singleSizeExceededCount = 0;
+  let budgetExceededCount = 0;
+  let totalBytes = 0;
+
+  for (const item of rawImages) {
+    if (typeof item !== "string") {
+      invalidCount += 1;
+      continue;
+    }
+    const trimmed = item.trim();
+    if (!trimmed.startsWith("data:image/") || !trimmed.includes(";base64,")) {
+      invalidCount += 1;
+      continue;
+    }
+    if (valid.length >= MAX_IMAGES_PER_REQUEST) {
+      countExceededCount += 1;
+      continue;
+    }
+    const base64Part = trimmed.split(";base64,")[1] || "";
+    if (base64Part.length === 0) {
+      invalidCount += 1;
+      continue;
+    }
+    const estimatedBytes = Math.ceil((base64Part.length * 3) / 4);
+    if (estimatedBytes > MAX_SINGLE_IMAGE_BYTES) {
+      singleSizeExceededCount += 1;
+      continue;
+    }
+    if (totalBytes + estimatedBytes > MAX_TOTAL_IMAGE_BYTES) {
+      budgetExceededCount += 1;
+      continue;
+    }
+    totalBytes += estimatedBytes;
+    valid.push(trimmed);
+  }
+
+  return {
+    valid,
+    receivedCount: rawImages.length,
+    invalidCount,
+    countExceededCount,
+    singleSizeExceededCount,
+    budgetExceededCount,
+    totalBytes,
+  };
 }
 
 function getImageHeaders(url: string): Record<string, string> {
@@ -723,7 +817,14 @@ function buildOpenAIRequestFromInput(
   imageDataUrls: string[],
   mode: UpstreamMode
 ) {
-  const prompt = buildUpstreamQuestion(input);
+  let prompt = buildUpstreamQuestion(input);
+  if (imageDataUrls.length > 0) {
+    const { promptQuestion, promptOptions } = resolvePromptSources(input);
+    const combinedText = [promptQuestion, ...(promptOptions || [])].join(" ");
+    if (combinedText.includes("[图片")) {
+      prompt = `${prompt}\n\nThe placeholders [图片1], [图片2], etc., refer to the attached images in the given order.`;
+    }
+  }
   const userContent = buildUserMessageContent(prompt, imageDataUrls);
   const body: Record<string, unknown> = {
     model: OPENAI_MODEL,
@@ -1123,67 +1224,90 @@ async function runUpstreamAttempt(
 }
 
 async function getAnswerFromUpstream(input: AnswerRequestInput, requestId: string) {
-  const detectedImageUrls = collectImageUrlsFromInput(input);
   let imageDataUrls: string[] = [];
 
-  if (detectedImageUrls.length > 0) {
-    const targetUrls = detectedImageUrls.slice(0, MAX_IMAGES_PER_REQUEST);
-    if (detectedImageUrls.length > MAX_IMAGES_PER_REQUEST) {
-      log("WARN", "image_count_exceeded", {
-        requestId,
-        detectedCount: detectedImageUrls.length,
-        allowedCount: MAX_IMAGES_PER_REQUEST,
-      });
-    }
+  const hasDirectImages =
+    (input.directImagesMeta?.receivedCount ?? 0) > 0 ||
+    (input.directImages?.length ?? 0) > 0;
 
-    log("INFO", "image_processing_started", {
+  if (hasDirectImages) {
+    imageDataUrls = (input.directImages || []).slice(0, MAX_IMAGES_PER_REQUEST);
+    const receivedCount =
+      input.directImagesMeta?.receivedCount ?? (input.directImages?.length || 0);
+    const validCount = imageDataUrls.length;
+    const logLevel = receivedCount > 0 && validCount === 0 ? "WARN" : "INFO";
+
+    log(logLevel, "direct_images_processed", {
       requestId,
-      count: targetUrls.length,
-      targets: targetUrls.map(previewUrlSafely),
+      receivedCount,
+      validCount,
+      invalidCount: input.directImagesMeta?.invalidCount ?? 0,
+      singleSizeExceededCount: input.directImagesMeta?.singleSizeExceededCount ?? 0,
+      budgetExceededCount: input.directImagesMeta?.budgetExceededCount ?? 0,
+      countExceededCount: input.directImagesMeta?.countExceededCount ?? 0,
+      totalBytes: input.directImagesMeta?.totalBytes ?? 0,
     });
-
-    const results = await Promise.all(
-      targetUrls.map((url) => fetchImageAsDataUrlSafe(url))
-    );
-
-    let accumulatedBytes = 0;
-    for (let i = 0; i < results.length; i += 1) {
-      const result = results[i];
-      const targetUrl = targetUrls[i];
-      const targetHost = (() => {
-        try {
-          return new URL(targetUrl).host;
-        } catch {
-          return "unknown";
-        }
-      })();
-
-      if (result.ok) {
-        if (accumulatedBytes + result.byteLength > MAX_TOTAL_IMAGE_BYTES) {
-          log("WARN", "image_download_failed", {
-            requestId,
-            host: targetHost,
-            reason: "total_image_budget_exceeded",
-          });
-          continue;
-        }
-        accumulatedBytes += result.byteLength;
-        imageDataUrls.push(result.dataUrl);
-      } else {
-        log("WARN", "image_download_failed", {
+  } else {
+    const detectedImageUrls = collectImageUrlsFromInput(input);
+    if (detectedImageUrls.length > 0) {
+      const targetUrls = detectedImageUrls.slice(0, MAX_IMAGES_PER_REQUEST);
+      if (detectedImageUrls.length > MAX_IMAGES_PER_REQUEST) {
+        log("WARN", "image_count_exceeded", {
           requestId,
-          host: result.host || targetHost,
-          reason: previewText(result.reason, 80),
+          detectedCount: detectedImageUrls.length,
+          allowedCount: MAX_IMAGES_PER_REQUEST,
         });
       }
-    }
 
-    log("INFO", "image_processing_completed", {
-      requestId,
-      detectedCount: detectedImageUrls.length,
-      successCount: imageDataUrls.length,
-      totalBytes: accumulatedBytes,
-    });
+      log("INFO", "image_processing_started", {
+        requestId,
+        count: targetUrls.length,
+        targets: targetUrls.map(previewUrlSafely),
+      });
+
+      const results = await Promise.all(
+        targetUrls.map((url) => fetchImageAsDataUrlSafe(url))
+      );
+
+      let accumulatedBytes = 0;
+      for (let i = 0; i < results.length; i += 1) {
+        const result = results[i];
+        const targetUrl = targetUrls[i];
+        const targetHost = (() => {
+          try {
+            return new URL(targetUrl).host;
+          } catch {
+            return "unknown";
+          }
+        })();
+
+        if (result.ok) {
+          if (accumulatedBytes + result.byteLength > MAX_TOTAL_IMAGE_BYTES) {
+            log("WARN", "image_download_failed", {
+              requestId,
+              host: targetHost,
+              reason: "total_image_budget_exceeded",
+            });
+            continue;
+          }
+          accumulatedBytes += result.byteLength;
+          imageDataUrls.push(result.dataUrl);
+        } else {
+          log("WARN", "image_download_failed", {
+            requestId,
+            host: result.host || targetHost,
+            reason: previewText(result.reason, 80),
+          });
+        }
+      }
+
+      log("INFO", "image_processing_completed", {
+        requestId,
+        detectedCount: detectedImageUrls.length,
+        successCount: imageDataUrls.length,
+        totalBytes: accumulatedBytes,
+      });
+    }
   }
 
   const firstAttempt = await runUpstreamAttempt(
@@ -1279,7 +1403,10 @@ async function handleClientRequest(req: Request): Promise<Response> {
     });
   }
 
-  if (url.pathname === "/" && (req.method === "GET" || req.method === "HEAD")) {
+  if (
+    (url.pathname === "/" || url.pathname === "/answer") &&
+    (req.method === "GET" || req.method === "HEAD")
+  ) {
     const responseData = {
       message: "OCS AI Answer service is running.",
       version: SERVICE_VERSION,
@@ -1365,24 +1492,32 @@ async function handleClientRequest(req: Request): Promise<Response> {
     return jsonResponse({ error: "JSON 格式错误" }, 400);
   }
 
-  const receivedKeys =
-    questionData && typeof questionData === "object" ? Object.keys(questionData) : [];
-  const optionsValue =
+  const body =
     questionData && typeof questionData === "object"
-      ? (questionData as Record<string, unknown>).options
+      ? (questionData as Record<string, unknown>)
       : undefined;
-  const typeValue =
-    questionData && typeof questionData === "object"
-      ? (questionData as Record<string, unknown>).type
-      : undefined;
+
+  const receivedKeys = body ? Object.keys(body) : [];
+  const optionsValue = body?.options;
+  const typeValue = body?.type;
+  const suggestionTitleValue = body?.suggestion_title || body?.suggestionTitle;
+  const suggestionOptionsValue = body?.suggestion_options || body?.suggestionOptions;
+  const rawImages = body?.images;
+
+  const directImagesResult = normalizeDirectImages(rawImages);
   const options = normalizeOptions(optionsValue);
+  const suggestionOptions = normalizeOptions(suggestionOptionsValue);
   const questionType =
     typeof typeValue === "string" && typeValue.trim().length > 0
       ? typeValue.trim()
       : undefined;
+  const suggestionTitle =
+    typeof suggestionTitleValue === "string" && suggestionTitleValue.trim().length > 0
+      ? suggestionTitleValue.trim()
+      : undefined;
 
   const question =
-    typeof questionData?.question === "string" ? questionData.question.trim() : "";
+    typeof body?.question === "string" ? (body.question as string).trim() : "";
 
   if (!question) {
     log("WARN", "request_question_missing", {
@@ -1390,11 +1525,7 @@ async function handleClientRequest(req: Request): Promise<Response> {
       receivedKeys,
       requestSummary: DEBUG_REQUEST_DETAILS
         ? {
-            question: summarizeValue(
-              questionData && typeof questionData === "object"
-                ? (questionData as Record<string, unknown>).question
-                : undefined
-            ),
+            question: summarizeValue(body?.question),
             options: summarizeValue(optionsValue),
             type: summarizeValue(typeValue),
             bodyPreview: previewText(requestBody, 400),
@@ -1422,6 +1553,10 @@ async function handleClientRequest(req: Request): Promise<Response> {
         question,
         options,
         type: questionType,
+        suggestionTitle,
+        suggestionOptions,
+        directImages: directImagesResult.valid,
+        directImagesMeta: directImagesResult,
       },
       requestId
     );
@@ -1457,6 +1592,7 @@ export {
   NO_ANSWER,
   extractImageUrls,
   collectImageUrlsFromInput,
+  normalizeDirectImages,
   resolveMimeType,
   getImageHeaders,
   fetchImageAsDataUrlSafe,

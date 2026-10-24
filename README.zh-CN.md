@@ -8,10 +8,11 @@
 ## 核心特性
 
 - 基于 Bun 的 HTTP 服务，日志为便于排查的逐行结构化输出。
+- 完全适配 OCS 5.x：原生支持 `HEAD /answer` 探活（消除卡片“连接失败”）；满足 5.x 图片题优化契约（消除黄字警告）；支持客户端 Base64 图片直传与服务端 URL 提取双路径。
 - 默认优先使用 JSON 模式请求上游；若 `response_format` 不被支持，会自动回退。
 - 固定输出结构：`{"question":"...","answer":"..."}`。
 - 支持接收 OCS 传来的可选 `options` 和 `type` 字段，提升单选、多选、判断题的命中率。
-- 自动化多模态图片处理：自动从题干与选项提取图片，结合防盗链头与出站 SSRF 防御，安全转换为 Base64 Data URL 并交付给多模态视觉模型。
+- 自动化多模态图片处理：直传 Base64 图片结合防盗链头与出站 SSRF 防御，安全交付给多模态视觉模型。
 - 自动修复常见异常输出，例如 Markdown 代码块包裹的 JSON、尾随解释文本等。
 - 对可恢复的上游异常统一降级为 `"不知道"`，避免 OCS 误判为题库连接失败。
 - 支持 Dockerfile 与 Docker Compose 部署。
@@ -63,6 +64,10 @@ docker compose up -d
 
 将下面配置中的 `homepage` 和 `url` 替换成你的部署地址：
 
+### 方案一：推荐配置（兼容 OCS 5.x 图片题优化与旧版 OCS 回退）
+
+该配置可完全消除 OCS 5.x 的黄字警告并启用客户端直传，同时自动兼容未升级的旧版 OCS：
+
 ```json
 [
   {
@@ -72,7 +77,37 @@ docker compose up -d
     "method": "post",
     "type": "GM_xmlhttpRequest",
     "contentType": "json",
-    "data": { "question": "${title}", "options": "${options}", "type": "${type}" },
+    "data": {
+      "question": { "handler": "return (env) => env.suggestion_title || env.title" },
+      "options": { "handler": "return (env) => env.suggestion_options || env.options" },
+      "type": "${type}",
+      "images": { "handler": "return (env) => env.images || []" }
+    },
+    "headers": { "Content-Type": "application/json" },
+    "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
+  }
+]
+```
+
+### 方案二：纯占位符配置（仅适用于 OCS 5.x+）
+
+如果你使用的是 OCS 5.x+ 且偏好简洁的纯占位符配置：
+
+```json
+[
+  {
+    "name": "OCS-AI-ANSWER",
+    "homepage": "http://your-host:3000/",
+    "url": "http://your-host:3000/answer",
+    "method": "post",
+    "type": "GM_xmlhttpRequest",
+    "contentType": "json",
+    "data": {
+      "question": "${suggestion_title}",
+      "options": "${suggestion_options}",
+      "type": "${type}",
+      "images": "${images}"
+    },
     "headers": { "Content-Type": "application/json" },
     "handler": "return (res) => { if (res && res.question && res.answer) { return [res.question, res.answer]; } if (res && res.error) { return ['AI answer service error: ' + res.error, undefined]; } return undefined; }"
   }
@@ -81,10 +116,12 @@ docker compose up -d
 
 ## 配置说明
 
+- **OCS 5.x 探活支持**：OCS 5.x 卡片会向配置的 `url` 发送 `HEAD /answer?t=<时间戳>` 进行健康探活，服务内置响应 200，题库卡片将显示“连接成功”。
+- **消除黄字警告**：配置中只要包含 `${suggestion_title}` 或 `${images}`，OCS 5.x 的“当前题库配置暂不支持图片、公式等题目处理”黄色警告将自动消除。
 - 如果不传 `SYSTEM_PROMPT`，服务会使用内置默认提示词，默认按 OCS 题型约束单选、多选、判断题的答案格式。
 - 服务不会主动传递 `max_tokens`、`temperature` 等采样参数。
 - 将 `DEBUG_REQUEST_DETAILS=true` 后，可在日志中看到实际收到的顶层字段，以及 `question`、`options`、`type` 的摘要，便于确认 OCS 是否真的把选项传过来了。
-- `POST /answer` 额外支持可选的 `options`、`type` 字段，并会一并传给上游模型。
+- `POST /answer` 额外支持可选的 `options`、`type`、`images`、`suggestion_title` 字段，并会一并传给上游模型。
 - 对可恢复的上游错误，服务会降级返回合法 JSON，`answer` 固定为 `"不知道"`。
 
 ## 帮助

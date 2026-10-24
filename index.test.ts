@@ -4,6 +4,7 @@ import {
   NO_ANSWER,
   extractImageUrls,
   collectImageUrlsFromInput,
+  normalizeDirectImages,
   resolveMimeType,
   getImageHeaders,
   fetchImageAsDataUrlSafe,
@@ -36,6 +37,16 @@ describe("Image URL Extraction and Normalization", () => {
     const urls = extractImageUrls(raw);
     expect(urls).toEqual([
       "https://p.ananas.chaoxing.com/star3/origin/339ca7147a5d90f58548c77fdecfd071.png",
+    ]);
+  });
+
+  it("should correctly split adjacent urls in parentheses without swallowing each other", () => {
+    const raw =
+      "https://p.ananas.chaoxing.com/star3/origin/43f381df.png(https://p.ananas.chaoxing.com/star3/origin/b3f236da.png为正整数);";
+    const urls = extractImageUrls(raw);
+    expect(urls).toEqual([
+      "https://p.ananas.chaoxing.com/star3/origin/43f381df.png",
+      "https://p.ananas.chaoxing.com/star3/origin/b3f236da.png",
     ]);
   });
 
@@ -278,9 +289,9 @@ describe("Redirect Hops and Manual Redirection", () => {
 });
 
 describe("Client Request Body Limits (M-A)", () => {
-  it("should reject client requests with body exceeding 1MB with 413 JSON and CORS", async () => {
+  it("should reject client requests with body exceeding 16MB with 413 JSON and CORS", async () => {
     const largeBody = JSON.stringify({
-      question: "x".repeat(1024 * 1024 + 100),
+      question: "x".repeat(16 * 1024 * 1024 + 100),
     });
     const req = new Request("http://localhost:3000/answer", {
       method: "POST",
@@ -451,6 +462,321 @@ describe("End-to-End Fallback on 413 Integration Test (M-D)", () => {
       const secondUserContent = sentBodies[1].messages[1].content;
       expect(typeof secondUserContent).toBe("string");
       expect(secondUserContent).not.toContain("data:image/");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("OCS 5.x Health Check and Probing", () => {
+  it("should respond 200 with CORS headers to HEAD /answer with query params", async () => {
+    const req = new Request("http://localhost:3000/answer?t=1710000000000", {
+      method: "HEAD",
+    });
+    const res = await handleClientRequest(req);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(res.headers.get("content-type")).toContain("application/json");
+  });
+
+  it("should respond 200 with service JSON to GET /answer with query params", async () => {
+    const req = new Request("http://localhost:3000/answer?t=1710000000000", {
+      method: "GET",
+    });
+    const res = await handleClientRequest(req);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    const json = await res.json();
+    expect(json.status).toBe("running");
+    expect(json.version).toBe(SERVICE_VERSION);
+  });
+});
+
+describe("OCS 5.x Image Optimization and v2 Contract", () => {
+  it("should normalize valid direct images and filter invalid ones", () => {
+    const sampleImages = [
+      "data:image/png;base64,iVBORw0KGgoAAA==",
+      "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+      "http://example.com/not-base64.png",
+      12345,
+    ];
+    const normalized = normalizeDirectImages(sampleImages);
+    expect(normalized.valid).toHaveLength(2);
+    expect(normalized.invalidCount).toBe(2);
+    expect(normalized.valid[0]).toBe("data:image/png;base64,iVBORw0KGgoAAA==");
+  });
+
+  it("should use suggestionTitle and suggestionOptions for upstream question when present", () => {
+    const input = {
+      question: "Original Question Text",
+      options: ["Original Option A", "Original Option B"],
+      suggestionTitle: "Question with [图片1] placeholder",
+      suggestionOptions: ["Option with [图片2]", "Option B"],
+      type: "single",
+    };
+    const prompt = buildUpstreamQuestion(input);
+    expect(prompt).toContain("Question: Question with [图片1] placeholder");
+    expect(prompt).toContain("Option with [图片2]");
+    expect(prompt).not.toContain("Original Question Text");
+  });
+
+  it("should handle direct images in /answer and preserve original question in response", async () => {
+    const originalFetch = globalThis.fetch;
+    let upstreamBody: any = null;
+
+    (globalThis as any).fetch = async (_url: any, opts: any) => {
+      upstreamBody = JSON.parse(opts.body);
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "model echoed", answer: "Direct Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const clientBody = JSON.stringify({
+        question: "Client Original Question",
+        suggestion_title: "Suggestion Question with [图片1]",
+        images: ["data:image/png;base64,iVBORw0KGgoAAA=="],
+        type: "single",
+      });
+
+      const req = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: clientBody,
+      });
+
+      const res = await handleClientRequest(req);
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.question).toBe("Client Original Question");
+      expect(json.answer).toBe("Direct Answer");
+
+      expect(upstreamBody).toBeDefined();
+      const userMessage = upstreamBody.messages[1].content;
+      expect(Array.isArray(userMessage)).toBe(true);
+      expect(userMessage[0].text).toContain("Suggestion Question with [图片1]");
+      expect(userMessage[1]).toEqual({
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,iVBORw0KGgoAAA==" },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("should drop images exceeding 4MB single size or exceeding 4 images count in normalizeDirectImages", () => {
+    const largeBase64 = "data:image/png;base64," + "A".repeat(5 * 1024 * 1024 * (4 / 3) + 100);
+    const validSmall = "data:image/png;base64,iVBORw0KGgoAAA==";
+    const emptyBase64 = "data:image/png;base64,";
+    const result = normalizeDirectImages([
+      largeBase64,
+      emptyBase64,
+      validSmall,
+      validSmall,
+      validSmall,
+      validSmall,
+      validSmall,
+    ]);
+    expect(result.valid).toHaveLength(4);
+    expect(result.singleSizeExceededCount).toBe(1);
+    expect(result.invalidCount).toBe(1);
+    expect(result.countExceededCount).toBe(1);
+  });
+
+  it("should explain image placeholder order in prompt only when placeholders and images are present", () => {
+    const input = {
+      question: "What is in [图片1] and [图片2]?",
+      type: "single",
+    };
+    const reqWithImages = buildOpenAIRequestFromInput(
+      input,
+      ["data:image/png;base64,iVBORw0KGgoAAA=="],
+      "json"
+    );
+    const userContentWithImages = (reqWithImages.messages as any[])[1].content;
+    const textPart = userContentWithImages.find((p: any) => p.type === "text");
+    expect(textPart.text).toContain(
+      "The placeholders [图片1], [图片2], etc., refer to the attached images in the given order."
+    );
+
+    const reqWithoutImages = buildOpenAIRequestFromInput(input, [], "json");
+    const userContentWithoutImages = (reqWithoutImages.messages as any[])[1].content;
+    expect(userContentWithoutImages).not.toContain(
+      "The placeholders [图片1], [图片2], etc., refer to the attached images in the given order."
+    );
+  });
+
+  it("should log direct_images_processed even when all direct images are invalid or filtered", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalConsoleLog = console.log;
+    const loggedEvents: any[] = [];
+    console.log = (msg: any) => {
+      try {
+        loggedEvents.push(JSON.parse(msg));
+      } catch {
+        // ignore non-json log
+      }
+    };
+
+    (globalThis as any).fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "echo", answer: "Valid Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const response = await handleClientRequest(
+        new Request("http://localhost:3000/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: "Question with [图片1]",
+            images: ["invalid_base64", "data:image/png;base64,"],
+            type: "single",
+          }),
+        })
+      );
+
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.answer).toBe("Valid Answer");
+
+      const directLog = loggedEvents.find((evt) => evt.event === "direct_images_processed");
+      expect(directLog).toBeDefined();
+      expect(directLog.level).toBe("WARN");
+      expect(directLog.receivedCount).toBe(2);
+      expect(directLog.validCount).toBe(0);
+      expect(directLog.invalidCount).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.log = originalConsoleLog;
+    }
+  });
+
+  it("should support directImages without directImagesMeta in getAnswerFromUpstream (N-1)", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalConsoleLog = console.log;
+    const loggedEvents: any[] = [];
+    console.log = (msg: any) => {
+      try {
+        loggedEvents.push(JSON.parse(msg));
+      } catch {
+        // ignore non-json log
+      }
+    };
+
+    let upstreamBody: any = null;
+    (globalThis as any).fetch = async (_url: any, opts: any) => {
+      upstreamBody = JSON.parse(opts.body);
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "echo", answer: "Direct Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const result = await getAnswerFromUpstream(
+        {
+          question: "Question without meta [图片1]",
+          directImages: ["data:image/png;base64,iVBORw0KGgoAAA=="],
+          type: "single",
+        },
+        "req-without-meta"
+      );
+
+      expect(result.degraded).toBe(false);
+      expect(result.payload.answer).toBe("Direct Answer");
+
+      expect(upstreamBody).toBeDefined();
+      const userMessage = upstreamBody.messages[1].content;
+      expect(Array.isArray(userMessage)).toBe(true);
+      expect(userMessage[1]).toEqual({
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,iVBORw0KGgoAAA==" },
+      });
+
+      const directLog = loggedEvents.find((evt) => evt.event === "direct_images_processed");
+      expect(directLog).toBeDefined();
+      expect(directLog.level).toBe("INFO");
+      expect(directLog.receivedCount).toBe(1);
+      expect(directLog.validCount).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.log = originalConsoleLog;
+    }
+  });
+
+  it("should accept direct images around 1.2MB without triggering 413", async () => {
+    const originalFetch = globalThis.fetch;
+    let upstreamBody: any = null;
+
+    (globalThis as any).fetch = async (_url: any, opts: any) => {
+      upstreamBody = JSON.parse(opts.body);
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ question: "echo", answer: "Large Image Answer" }),
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    };
+
+    try {
+      const largeBase64Image = "data:image/png;base64," + "A".repeat(1200 * 1024);
+      const clientBody = JSON.stringify({
+        question: "1.2MB Image Question",
+        images: [largeBase64Image],
+        type: "single",
+      });
+
+      const req = new Request("http://localhost:3000/answer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(clientBody.length),
+        },
+        body: clientBody,
+      });
+
+      const res = await handleClientRequest(req);
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.answer).toBe("Large Image Answer");
+      expect(upstreamBody).toBeDefined();
+      const content = upstreamBody.messages[1].content;
+      expect(Array.isArray(content)).toBe(true);
+      expect(content[1].type).toBe("image_url");
     } finally {
       globalThis.fetch = originalFetch;
     }
